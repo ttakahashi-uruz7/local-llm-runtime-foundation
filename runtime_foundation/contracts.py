@@ -699,6 +699,7 @@ class ExecutionTrace:
     effective_runtime_settings: dict[str, Any] | None
     host_observation: dict[str, Any]
     started_at: str
+    runtime_settings_resolution: RuntimeSettingsResolution | None = None
     finished_at: str | None = None
     status: str = "running"
     metrics: dict[str, Any] | None = None
@@ -714,6 +715,9 @@ class ExecutionTrace:
             "artifact": self.artifact.to_dict(),
             "requested_runtime_settings": dict(self.requested_runtime_settings),
             "effective_runtime_settings": self.effective_runtime_settings,
+            "runtime_settings_resolution": (
+                self.runtime_settings_resolution.to_dict() if self.runtime_settings_resolution else None
+            ),
             "host_observation": dict(self.host_observation),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -737,6 +741,7 @@ class GenerationResult:
     trace: ExecutionTrace | None = None
     requested_runtime_settings: dict[str, Any] | None = None
     effective_runtime_settings: dict[str, Any] | None = None
+    runtime_settings_resolution: RuntimeSettingsResolution | None = None
 
     @property
     def adapter(self) -> str:
@@ -760,6 +765,9 @@ class GenerationResult:
             "trace": self.trace.to_dict() if self.trace else None,
             "requested_runtime_settings": self.requested_runtime_settings,
             "effective_runtime_settings": self.effective_runtime_settings,
+            "runtime_settings_resolution": (
+                self.runtime_settings_resolution.to_dict() if self.runtime_settings_resolution else None
+            ),
         }
 
 

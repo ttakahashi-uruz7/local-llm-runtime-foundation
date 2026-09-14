@@ -22,6 +22,12 @@ The unauthenticated v1 service binds to loopback only: `127.0.0.1`, `::1`, or `l
 
 Foundation does not know a consumer's registry record, quality policy, or production profile. A consumer should store the returned execution trace in its own evidence system if it needs durable lineage.
 
+### Runtime resolution and cleanup evidence
+
+On a successful generate, and on the terminal `completed` event from streaming, read `runtime_settings_resolution` from the result. The same payload is available in the `ExecutionTrace`; it is the adapter's raw resolution evidence and includes requested/effective settings, per-option status, and warnings. Consumers must store these values as received and must not recompute them from capability data.
+
+On unload, preserve `UnloadResult.raw.cleanup_status`. `clean` is a successful cleanup observation, `cleanup_error` is a failure observation, and a missing/unknown value is unresolved. Policy-owning consumers must not treat unresolved cleanup as a pass. `GenerationRequest.timeout_ms` remains a Foundation Core cooperative runtime deadline; an HTTP client timeout must not replace its `runtime_timeout` authority.
+
 ## Benchmark Studio
 
 Benchmark keeps:

@@ -55,12 +55,17 @@ def test_mock_lifecycle_generate_trace_and_unload(tmp_path: Path) -> None:
     assert result.trace.status == "completed"
     assert result.requested_runtime_settings["acceleration"]["backend"] == "auto"
     assert result.effective_runtime_settings["acceleration"]["backend"] == "cpu"
+    assert result.runtime_settings_resolution is not None
+    assert result.runtime_settings_resolution.to_dict()["option_status"]
+    assert result.runtime_settings_resolution.to_dict()["warnings"]
+    assert result.trace.to_dict()["runtime_settings_resolution"] == result.runtime_settings_resolution.to_dict()
     assert result.metrics.measurement_provenance == "simulated"
     assert core.get_execution(result.execution_id)["engine"]["engine"] == "mock"
     assert core.health()["lifecycle_state"] == "LOADED"
 
     unloaded = core.unload(artifact.artifact_id)
     assert unloaded["unloaded"] is True
+    assert unloaded["raw"]["cleanup_status"] == "clean"
     assert core.health()["lifecycle_state"] == "UNLOADED"
 
 
@@ -204,6 +209,9 @@ def test_requested_and_effective_options_and_unsupported_option(tmp_path: Path) 
             )
         )
     assert caught.value.details["execution_id"]
+    failed_trace = core.get_execution(caught.value.details["execution_id"])
+    assert failed_trace["runtime_settings_resolution"] is None
+    assert failed_trace["effective_runtime_settings"] is None
     assert core.health()["lifecycle_state"] == "LOADED"
 
     with pytest.raises(UnsupportedRuntimeOptionError) as prompt_cache_error:
@@ -235,6 +243,25 @@ def test_stream_and_cancel_leave_loaded_state_consistent(tmp_path: Path) -> None
     assert core.health()["lifecycle_state"] == "LOADED"
     execution_id = remainder[-1].error["details"]["execution_id"]
     assert core.get_execution(execution_id)["status"] == "cancelled"
+
+
+def test_stream_completed_result_exposes_same_runtime_resolution_as_trace(tmp_path: Path) -> None:
+    core, artifact = build_core(tmp_path)
+    core.load(artifact, adapter="mock")
+    events = list(
+        core.stream(
+            GenerationRequest(
+                model_artifact_id=artifact.artifact_id,
+                request_id="completed-stream",
+                messages=[{"role": "user", "content": "stream resolution"}],
+            )
+        )
+    )
+    completed = next(event for event in events if event.type == "completed")
+    resolution = completed.result["runtime_settings_resolution"]
+    assert resolution["option_status"]
+    assert resolution["warnings"]
+    assert completed.result["trace"]["runtime_settings_resolution"] == resolution
 
 
 def test_consumer_leases_prevent_cross_consumer_unload_and_switch(tmp_path: Path) -> None:
