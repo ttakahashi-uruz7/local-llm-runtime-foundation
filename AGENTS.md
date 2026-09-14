@@ -68,6 +68,29 @@ Do not speculate about GitHub permissions, OAuth scopes, or credentials and wait
 
 Choose the work branch and base from repository history, current specifications, existing Pull Requests, existing branches, and task scope whenever those facts make the choice safe. Do not ask the user to resolve routine branch/base ambiguity that repository investigation can resolve.
 
+## PR Completion Gate / Definition of Done
+
+For every ordinary implementation, fix, refactor, migration, or documentation task that changes files, the complete unit of work is:
+
+`branch -> implementation -> validation -> commit -> push -> Pull Request create/update`
+
+The task is **INCOMPLETE** until the Pull Request creation or update has been verified. The following states are also incomplete:
+
+- Changes exist only locally.
+- Changes are committed but not pushed.
+- A work branch is pushed but no Pull Request exists.
+- A branch associated with an existing Pull Request is pushed but the Pull Request update has not been confirmed.
+
+Clean working tree, passing tests, a completed commit, or a completed push alone do not satisfy this gate. A final report may use completion language only after the Pull Request number and URL are confirmed. Before that confirmation, do not report `SUCCESS`, `COMPLETE`, `DONE`, `MERGE READY`, `DEVELOPMENT COMPLETE`, or equivalent Japanese completion wording such as `作業完了` or `完了しました`.
+
+Branch creation, commit, push, Pull Request creation, Pull Request update, and Pull Request body update are standard pre-approved development operations. Do not ask whether it is acceptable to create a Pull Request, push to GitHub, or update a Pull Request, and do not stop immediately before those operations.
+
+The only valid reason to stop before the Pull Request create/update gate is an actual HARD STOP defined by this file, such as an authentication, permission, or OAuth/scope rejection encountered while attempting the operation, repository corruption, an unpreservable user change, or a required destructive conflict. Do not stop based on speculation that permission may be missing or that confirmation may be needed.
+
+For a multi-repository task, every changed repository must independently reach verified Pull Request create/update state before the overall task may be reported as complete. The final report must include, for each repository: branch, base SHA, final local SHA, remote SHA, commit, push, PR number, PR URL, PR updated/created status, Git status, `Force push: NO`, and `Main merge: NO`.
+
+Pull Request completion is separate from merge approval. Pull Request creation and update are autonomous; merging a Pull Request or `main` still requires explicit user approval.
+
 ## Codex protocol
 
 All multi-step work is reported as `Step X/N`. If scope expands, update N. Investigate repository state and current specifications before asking routine design questions. Fix ordinary test failures, type errors, missing fixtures, and small contract decisions autonomously. Do not treat the following as a HARD STOP or user confirmation gate: ordinary test failures, implementation bugs, type errors, lint failures, missing fixtures, additional test needs, documentation updates, commit creation, branch push, Pull Request creation, Pull Request updates, lack of separate permission for Pull Request creation, or the absence of a Mac Production Validation environment. Without a Mac, complete all safe Windows development, tests, commits, pushes, and Pull Request updates.
