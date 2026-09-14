@@ -29,6 +29,8 @@ python -m runtime_foundation
 
 The Windows development path uses `MockAdapter` only when the consumer explicitly requests `engine="mock"`. An MLX/GGUF artifact never silently falls back to Mock. MLX and Metal are imported lazily and are expected to be unavailable on Windows. Foundation v1 does not download models, commit weights, call cloud inference, or modify consumer configuration.
 
+`RuntimeSettingsResolution` is consumer-visible raw evidence. Successful generate results, streaming `completed` results, and `ExecutionTrace` expose the same requested/effective settings, `option_status`, and `warnings`; consumers must preserve these values rather than infer them. Unload preserves the adapter's raw `cleanup_status` (`clean` or `cleanup_error`) in `UnloadResult.raw`. `GenerationRequest.timeout_ms` remains a Foundation Core cooperative runtime timeout.
+
 ## Contract and service
 
 - Contract version: `runtime-foundation.contract.v1`

@@ -8,6 +8,7 @@ from runtime_foundation import (
     ModelArtifactBinding,
     RuntimeErrorRecord,
     RuntimeOptions,
+    RuntimeSettingsResolution,
 )
 from runtime_foundation.errors import RuntimeOptionsAliasConflictError, RuntimeOptionsSchemaMismatchError
 
@@ -65,3 +66,21 @@ def test_runtime_error_contract_has_no_policy_fields() -> None:
     assert payload["contract_version"] == CONTRACT_VERSION
     assert "production_eligible" not in payload
     assert "score" not in payload
+
+
+def test_runtime_settings_resolution_is_json_safe_raw_evidence() -> None:
+    requested = RuntimeOptions.from_payload({"context": {"context_length": 32768}})
+    effective = RuntimeOptions.from_payload({"context": {"context_length": 32768}})
+    resolution = RuntimeSettingsResolution(
+        requested=requested,
+        effective=effective,
+        option_status={"context.context_length": "supported"},
+        warnings=["context default preserved by adapter"],
+    )
+
+    payload = resolution.to_dict()
+    assert payload["contract_version"] == CONTRACT_VERSION
+    assert payload["requested_runtime_settings"] == requested.to_dict()
+    assert payload["effective_runtime_settings"] == effective.to_dict()
+    assert payload["option_status"] == {"context.context_length": "supported"}
+    assert payload["warnings"] == ["context default preserved by adapter"]

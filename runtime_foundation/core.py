@@ -420,6 +420,7 @@ class RuntimeCore:
         try:
             resolution: RuntimeSettingsResolution = selected.resolve_runtime_options(request.runtime_options)
             self._raise_if_timed_out(request, timeout_event, trace)
+            trace.runtime_settings_resolution = resolution
             trace.effective_runtime_settings = resolution.effective.to_dict()
             effective_request = replace(request, runtime_options=resolution.effective)
             result = selected.generate(effective_request, cancel_event)
@@ -431,6 +432,7 @@ class RuntimeCore:
             result.execution_id = trace.execution_id
             result.requested_runtime_settings = resolution.requested.to_dict()
             result.effective_runtime_settings = resolution.effective.to_dict()
+            result.runtime_settings_resolution = resolution
             trace.status = "completed"
             trace.metrics = result.metrics.to_dict()
             trace.finish_reason = result.finish_reason
@@ -473,6 +475,7 @@ class RuntimeCore:
                 yield StreamEvent(type="started", request_id=request.request_id, sequence=sequence)
                 resolution = selected.resolve_runtime_options(request.runtime_options)
                 self._raise_if_timed_out(request, timeout_event, trace)
+                trace.runtime_settings_resolution = resolution
                 trace.effective_runtime_settings = resolution.effective.to_dict()
                 effective_request = replace(request, runtime_options=resolution.effective)
                 for event in selected.stream(effective_request, cancel_event):
@@ -489,6 +492,7 @@ class RuntimeCore:
                         result_payload["execution_id"] = trace.execution_id
                         result_payload["requested_runtime_settings"] = resolution.requested.to_dict()
                         result_payload["effective_runtime_settings"] = resolution.effective.to_dict()
+                        result_payload["runtime_settings_resolution"] = resolution.to_dict()
                         trace.status = "completed"
                         trace.metrics = metrics_payload
                         trace.finish_reason = result_payload.get("finish_reason")
