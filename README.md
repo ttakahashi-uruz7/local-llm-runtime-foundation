@@ -27,13 +27,14 @@ python -m pytest --basetemp=.pytest-temp
 python -m runtime_foundation
 ```
 
-The Windows development path uses `MockAdapter`. MLX and Metal are imported lazily and are expected to be unavailable on Windows. Foundation v1 does not download models, commit weights, call cloud inference, or modify consumer configuration.
+The Windows development path uses `MockAdapter` only when the consumer explicitly requests `engine="mock"`. An MLX/GGUF artifact never silently falls back to Mock. MLX and Metal are imported lazily and are expected to be unavailable on Windows. Foundation v1 does not download models, commit weights, call cloud inference, or modify consumer configuration.
 
 ## Contract and service
 
 - Contract version: `runtime-foundation.contract.v1`
 - Foundation version: `0.1.0`
 - Default local service: `http://127.0.0.1:8765`
+- Service bind is loopback-only (`127.0.0.1`, `::1`, or `localhost`); unauthenticated LAN/remote binding is rejected.
 - `GET /health`, `GET /host`, `GET /engines`
 - `GET /engines/{engine}/capability`
 - `POST /models/load`, `POST /models/unload`
