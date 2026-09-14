@@ -439,13 +439,17 @@ class RuntimeCore:
             self._last_error = None
             return result
         except RuntimeFoundationError as exc:
-            if timeout_event.is_set() and exc.code in {"cancelled", "engine_runtime_error"}:
+            timeout_cause: RuntimeFoundationError | None = None
+            if timeout_event.is_set() and exc.code != "runtime_timeout":
+                timeout_cause = exc
                 exc = self._timeout_error(request, trace)
             trace.status = "cancelled" if exc.code == "cancelled" else "error"
             exc.details.setdefault("execution_id", trace.execution_id)
             trace.error = error_payload(exc, execution_id=trace.execution_id)
             trace.finished_at = utc_now()
             self._last_error = trace.error
+            if timeout_cause is not None:
+                raise exc from timeout_cause
             raise
         except Exception as exc:
             wrapped = EngineRuntimeError("engine generation failed", details={"engine": selected.name, "execution_id": trace.execution_id})
@@ -495,23 +499,25 @@ class RuntimeCore:
                     elif event.type == "error":
                         terminal_error = True
                         error = dict(event.error or {})
-                        if timeout_event.is_set() and error.get("code") == "cancelled":
+                        if timeout_event.is_set() and error.get("code") != "runtime_timeout":
                             error = error_payload(self._timeout_error(request, trace))
                         error.setdefault("details", {})["execution_id"] = trace.execution_id
                         event.error = error
                         trace.status = "cancelled" if error.get("code") == "cancelled" else "error"
                         trace.error = error
                         trace.finished_at = utc_now()
+                        self._last_error = error
                     event.sequence = sequence
                     yield event
                 if not terminal_error:
                     self._raise_if_timed_out(request, timeout_event, trace)
             except RuntimeFoundationError as exc:
-                if timeout_event.is_set() and exc.code in {"cancelled", "engine_runtime_error"}:
+                if timeout_event.is_set() and exc.code != "runtime_timeout":
                     exc = self._timeout_error(request, trace)
                 trace.status = "cancelled" if exc.code == "cancelled" else "error"
                 trace.error = error_payload(exc, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
+                self._last_error = trace.error
                 sequence += 1
                 yield StreamEvent(
                     type="error",
@@ -525,6 +531,7 @@ class RuntimeCore:
                 trace.status = "error"
                 trace.error = error_payload(wrapped, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
+                self._last_error = trace.error
                 sequence += 1
                 yield StreamEvent(
                     type="error",

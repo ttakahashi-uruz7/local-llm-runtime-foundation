@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 
+import pytest
+
 from runtime_foundation import HostProfile
 import runtime_foundation.host as host_module
 
@@ -37,3 +39,23 @@ def test_process_memory_returns_unavailable_instead_of_peak_counter(monkeypatch)
     monkeypatch.setattr(host_module, "_platform_current_rss_bytes", lambda system: None)
     monkeypatch.setitem(sys.modules, "psutil", None)
     assert host_module.process_memory_bytes() is None
+
+
+@pytest.mark.parametrize(("machine", "expected"), [("arm64", 16 * 1024**3), ("x86_64", None)])
+def test_unified_memory_is_limited_to_apple_silicon(monkeypatch, machine: str, expected: int | None) -> None:
+    monkeypatch.setattr(host_module.platform_module, "system", lambda: "Darwin")
+    monkeypatch.setattr(host_module.platform_module, "machine", lambda: machine)
+    monkeypatch.setattr(host_module.platform_module, "release", lambda: "24.0.0")
+    monkeypatch.setattr(host_module.platform_module, "version", lambda: "Darwin test")
+    monkeypatch.setattr(host_module, "_physical_memory_bytes", lambda system: 16 * 1024**3)
+    monkeypatch.setattr(host_module, "_darwin_sysctl", lambda name: None)
+    monkeypatch.setattr(host_module, "_darwin_swap", lambda: (None, None))
+    monkeypatch.setattr(host_module, "_darwin_memory_pressure", lambda: None)
+    monkeypatch.setattr(host_module, "_mlx_status", lambda system, architecture: (False, False, None, None, "test"))
+
+    profile = HostProfile.detect()
+
+    assert profile.platform == "darwin"
+    assert profile.architecture == ("arm64" if machine == "arm64" else "x86_64")
+    assert profile.physical_memory_bytes == 16 * 1024**3
+    assert profile.unified_memory_bytes == expected

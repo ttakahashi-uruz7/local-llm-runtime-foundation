@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from .contracts import GenerationRequest, ModelArtifactBinding
+from .network import validate_loopback_url
 
 
 class RemoteRuntimeError(Exception):
@@ -35,6 +36,7 @@ class LocalRuntimeClient:
         timeout: float | None = 60.0,
         http_client: httpx.Client | None = None,
     ) -> None:
+        base_url = validate_loopback_url(base_url)
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
         if http_client is not None:

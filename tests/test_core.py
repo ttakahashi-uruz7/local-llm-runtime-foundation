@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from runtime_foundation import GenerationRequest, HostProfile, ModelArtifactBinding, RuntimeCore, RuntimeOptions
+from runtime_foundation.adapters.mock import MockAdapter
 from runtime_foundation.errors import (
     ArtifactNotFoundError,
     ContextLengthExceededError,
@@ -13,8 +14,18 @@ from runtime_foundation.errors import (
     EngineUnavailableError,
     LoadConflictError,
     RuntimeTimeoutError,
+    RequestCancelledError,
     UnsupportedRuntimeOptionError,
 )
+
+
+class CoreTimerCancellationAdapter(MockAdapter):
+    """Adapter double that only reports cancellation after Core's timer fires."""
+
+    def generate(self, request, cancel_event):
+        del request
+        assert cancel_event.wait(1.0), "Core timeout did not request adapter cancellation"
+        raise RequestCancelledError("adapter observed Core timeout cancellation")
 
 
 def build_core(tmp_path: Path) -> tuple[RuntimeCore, ModelArtifactBinding]:
@@ -137,6 +148,35 @@ def test_timeout_is_cooperative_and_reaches_runtime_timeout(tmp_path: Path) -> N
         core.generate(request)
     assert caught.value.details["timeout_semantics"] == "cooperative"
     assert core.health()["lifecycle_state"] == "LOADED"
+
+
+def test_core_timeout_authority_overrides_adapter_cancellation(tmp_path: Path) -> None:
+    model = tmp_path / "timeout-double.bin"
+    model.write_bytes(b"timeout fixture")
+    artifact = ModelArtifactBinding("timeout-double", str(model), "bin")
+    core = RuntimeCore(
+        host_profile=HostProfile.mock_windows(),
+        adapters={"mock": CoreTimerCancellationAdapter()},
+    )
+    core.load(artifact, adapter="mock")
+
+    with pytest.raises(RuntimeTimeoutError) as caught:
+        core.generate(
+            GenerationRequest(
+                model_artifact_id=artifact.artifact_id,
+                messages=[{"role": "user", "content": "Core timeout authority"}],
+                timeout_ms=5,
+            )
+        )
+
+    assert caught.value.code == "runtime_timeout"
+    assert caught.value.__cause__ is not None
+    assert caught.value.__cause__.code == "cancelled"
+    execution_id = caught.value.details["execution_id"]
+    execution = core.get_execution(execution_id)
+    assert execution is not None
+    assert execution["error"]["code"] == "runtime_timeout"
+    assert core.health()["last_error"]["code"] == "runtime_timeout"
 
 
 def test_requested_and_effective_options_and_unsupported_option(tmp_path: Path) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 from typing import Any
@@ -13,26 +12,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .contracts import CONTRACT_VERSION, GenerationRequest, ModelArtifactBinding
 from .core import RuntimeCore
 from .errors import InvalidRequestError, RuntimeFoundationError
+from .network import validate_loopback_host
 from .version import FOUNDATION_VERSION
-
-
-def validate_loopback_host(value: str | None) -> str:
-    """Allow only loopback bind addresses for the unauthenticated v1 service."""
-
-    host = (value or "127.0.0.1").strip()
-    if host.lower() == "localhost":
-        return host
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError as exc:
-        raise ValueError(
-            "RUNTIME_FOUNDATION_HOST must be localhost, 127.0.0.1, ::1, or another loopback address"
-        ) from exc
-    if not address.is_loopback:
-        raise ValueError(
-            "RUNTIME_FOUNDATION_HOST must be a loopback address; remote/LAN binding is not supported in Foundation v1"
-        )
-    return host
 
 
 def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding:

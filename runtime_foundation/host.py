@@ -274,7 +274,7 @@ class HostProfile:
             hardware_model=_darwin_sysctl("hw.model") if is_darwin else None,
             cpu_count=os.cpu_count(),
             physical_memory_bytes=physical,
-            unified_memory_bytes=physical if is_darwin else None,
+            unified_memory_bytes=physical if is_darwin and architecture == "arm64" else None,
             memory_pressure=_darwin_memory_pressure() if is_darwin else None,
             swap_used_bytes=swap_used,
             swap_total_bytes=swap_total,

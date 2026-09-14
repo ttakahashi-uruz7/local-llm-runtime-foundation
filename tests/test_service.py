@@ -7,7 +7,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from runtime_foundation import HostProfile, ModelArtifactBinding, RuntimeCore
+from runtime_foundation.adapters.mock import MockAdapter
+from runtime_foundation.errors import RequestCancelledError
 from runtime_foundation.service import create_app, validate_loopback_host
+
+
+class ServiceTimeoutCancellationAdapter(MockAdapter):
+    def generate(self, request, cancel_event):
+        del request
+        assert cancel_event.wait(1.0), "Core timeout did not request adapter cancellation"
+        raise RequestCancelledError("adapter observed Core timeout cancellation")
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "127.0.0.2"])
@@ -107,3 +116,31 @@ def test_service_missing_artifact_has_stable_error_shape(tmp_path: Path) -> None
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "artifact_not_found"
+
+
+def test_service_exposes_core_timeout_as_http_504(tmp_path: Path) -> None:
+    model = tmp_path / "service-timeout.bin"
+    model.write_bytes(b"service timeout fixture")
+    artifact = ModelArtifactBinding("service-timeout", str(model), "bin")
+    core = RuntimeCore(
+        host_profile=HostProfile.mock_windows(),
+        adapters={"mock": ServiceTimeoutCancellationAdapter()},
+    )
+    client = TestClient(create_app(core))
+    loaded = client.post("/models/load", json={"artifact": artifact.to_dict(), "engine": "mock"})
+    assert loaded.status_code == 200
+
+    response = client.post(
+        "/generate",
+        json={
+            "model_artifact_id": artifact.artifact_id,
+            "lease_id": loaded.json()["lease_id"],
+            "messages": [{"role": "user", "content": "service timeout"}],
+            "timeout_ms": 5,
+        },
+    )
+
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "runtime_timeout"
+    assert response.json()["error"]["details"]["execution_id"]
+    assert client.get("/health").json()["last_error"]["code"] == "runtime_timeout"

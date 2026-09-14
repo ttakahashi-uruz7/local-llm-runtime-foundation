@@ -223,10 +223,14 @@ class MockAdapter(EngineAdapter):
         if effective.acceleration.backend == "auto":
             effective = replace(effective, acceleration=replace(effective.acceleration, backend="cpu"))
             warnings.append("Mock resolved acceleration.backend auto to cpu")
+        capability = self.discover_capability()
         return RuntimeSettingsResolution(
             requested=requested,
             effective=effective,
-            option_status={path: "supported" for path in RUNTIME_OPTION_PATHS},
+            option_status={
+                path: str(capability.runtime_options.get(path, {}).get("status", "unsupported"))
+                for path in RUNTIME_OPTION_PATHS
+            },
             warnings=warnings,
         )
 
