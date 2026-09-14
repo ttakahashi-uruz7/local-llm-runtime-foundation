@@ -92,6 +92,11 @@ class RuntimeTimeoutError(RuntimeFoundationError):
     retryable = True
 
 
+class ContextLengthExceededError(RuntimeFoundationError):
+    code = "context_length_exceeded"
+    http_status = 400
+
+
 class UnsupportedRuntimeOptionError(RuntimeFoundationError):
     code = "unsupported_runtime_option"
     http_status = 400

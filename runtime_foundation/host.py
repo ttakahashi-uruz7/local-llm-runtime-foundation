@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from .contracts import CONTRACT_VERSION, utc_now
@@ -121,18 +122,61 @@ def _physical_memory_bytes(system: str) -> int | None:
     return None
 
 
-def process_memory_bytes() -> int | None:
-    """Return a best-effort process footprint without making it a policy result."""
-
+def _windows_current_rss_bytes() -> int | None:
     try:
-        import resource
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
 
-        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-        if _normalize_platform(platform_module.system()) != "darwin":
-            value *= 1024
-        return value
-    except (ImportError, OSError, ValueError):
-        pass
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(ProcessMemoryCounters)
+        process = ctypes.windll.kernel32.GetCurrentProcess()
+        get_info = ctypes.windll.psapi.GetProcessMemoryInfo
+        if get_info(process, ctypes.byref(counters), counters.cb):
+            return int(counters.WorkingSetSize)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _platform_current_rss_bytes(system: str) -> int | None:
+    """Read a point-in-time RSS without using a peak-memory counter."""
+
+    if system == "windows":
+        return _windows_current_rss_bytes()
+    if system == "darwin":
+        value = _command_output("ps", "-o", "rss=", "-p", str(os.getpid()))
+        try:
+            return int(value) * 1024 if value else None
+        except ValueError:
+            return None
+    if system == "linux":
+        try:
+            resident_pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[1])
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return resident_pages * page_size if isinstance(page_size, int) else None
+        except (OSError, IndexError, ValueError):
+            return None
+    return None
+
+
+def process_memory_bytes() -> int | None:
+    """Return current point-in-time process RSS, never a peak counter."""
+
+    system = _normalize_platform(platform_module.system())
+    current = _platform_current_rss_bytes(system)
+    if current is not None:
+        return current
     try:
         import psutil  # type: ignore[import-not-found]
 

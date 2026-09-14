@@ -27,6 +27,7 @@ The reference mapping is:
 
 | Contract setting | MLX/mx-lm mapping | Failure if unavailable |
 | --- | --- | --- |
+| `context.context_length` | Foundation preflight budget: prompt tokens + `max_tokens` | `context_length_exceeded` when the request exceeds the budget |
 | `prefill.chunk_size` | `prefill_step_size` | `unsupported_runtime_option` |
 | `kv_cache.bits` | `kv_bits` | `unsupported_runtime_option` |
 | `kv_cache.group_size` | `kv_group_size` | `unsupported_runtime_option` |
@@ -38,6 +39,8 @@ The reference mapping is:
 The current upstream `mlx-lm` API exposes `load`, `stream_generate`, `GenerationResponse`, chat templates, and the KV/prefill arguments used above. The Foundation implementation still marks real execution as **Mac validation pending** because this Windows host cannot validate API behavior, Metal allocation, cache cleanup, or observed throughput.
 
 The adapter loads only a consumer-supplied local path. Foundation v1 does not download a model or mutate a registry.
+
+`GenerationRequest.timeout_ms` is enforced cooperatively by the Core deadline and the adapter's cancellation/deadline checks. The adapter must not silently ignore it. MLX peak memory is recorded only when the engine reports a peak value; current process RSS comes from the host observation helper and is not substituted for peak memory.
 
 ## Mock adapter
 

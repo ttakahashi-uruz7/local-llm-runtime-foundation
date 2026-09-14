@@ -31,11 +31,13 @@ from .errors import (
     ArtifactNotFoundError,
     EngineNotFoundError,
     EngineRuntimeError,
+    EngineUnavailableError,
     LoadConflictError,
     ModelNotLoadedError,
     RequestCancelledError,
     RuntimeBusyError,
     RuntimeFoundationError,
+    RuntimeTimeoutError,
     UnloadConflictError,
     error_payload,
 )
@@ -50,12 +52,20 @@ DEFAULT_CONSUMER_ID = "anonymous"
 class _ActiveRequest:
     request: GenerationRequest
     cancel_event: threading.Event
+    timeout_event: threading.Event
     adapter: EngineAdapter
     trace: ExecutionTrace
+    timeout_timer: threading.Timer | None = None
 
 
 class RuntimeCore:
     """Own one loaded model process and expose engine-neutral operations."""
+
+    _ARTIFACT_ENGINE_MAP = {
+        "mlx": "mlx",
+        "safetensors": "mlx",
+        "gguf": "llama.cpp",
+    }
 
     def __init__(
         self,
@@ -98,18 +108,38 @@ class RuntimeCore:
         return ModelArtifactBinding.from_payload(value)
 
     def _select_adapter(self, artifact: ModelArtifactBinding, requested: str | None) -> EngineAdapter:
-        if requested:
+        engine_name = requested.strip() if isinstance(requested, str) and requested.strip() else None
+        if engine_name:
             try:
-                return self.adapters[requested]
+                selected = self.adapters[engine_name]
             except KeyError as exc:
-                raise EngineNotFoundError("requested engine is not registered", details={"engine": requested}) from exc
-        if artifact.format == "gguf" and "llama.cpp" in self.adapters:
-            return self.adapters["llama.cpp"]
-        if artifact.format in {"mlx", "safetensors"} and "mlx" in self.adapters:
-            capability = self.adapters["mlx"].discover_capability()
-            if capability.available:
-                return self.adapters["mlx"]
-        return self.adapters.get("mock") or next(iter(self.adapters.values()))
+                raise EngineNotFoundError("requested engine is not registered", details={"engine": engine_name}) from exc
+        else:
+            engine_name = self._ARTIFACT_ENGINE_MAP.get(artifact.format)
+            if engine_name is None:
+                raise EngineNotFoundError(
+                    "no engine is registered for the artifact format; specify a supported engine explicitly",
+                    details={"format": artifact.format, "artifact_id": artifact.artifact_id},
+                )
+            try:
+                selected = self.adapters[engine_name]
+            except KeyError as exc:
+                raise EngineNotFoundError(
+                    "the artifact format maps to an engine that is not registered",
+                    details={"format": artifact.format, "engine": engine_name},
+                ) from exc
+
+        capability = selected.discover_capability()
+        if not capability.available:
+            raise EngineUnavailableError(
+                "the requested engine is registered but unavailable",
+                details={
+                    "engine": selected.name,
+                    "format": artifact.format,
+                    "reason": capability.reason,
+                },
+            )
+        return selected
 
     def capabilities(self) -> list[dict[str, Any]]:
         return [self.adapters[name].discover_capability().to_dict() for name in sorted(self.adapters)]
@@ -138,26 +168,38 @@ class RuntimeCore:
                 details={"artifact_id": binding.artifact_id, "local_path": binding.local_path},
             )
         owner = self._consumer_id(consumer_id)
-        selected = self._select_adapter(binding, adapter)
+        try:
+            selected = self._select_adapter(binding, adapter)
+        except RuntimeFoundationError as exc:
+            with self._lock:
+                self._state = LifecycleState.ERROR
+                self._last_error = exc.as_dict()
+            raise
         with self._lock:
             if self._loaded_artifact is not None:
-                if self._loaded_artifact.artifact_id == binding.artifact_id and self._loaded_adapter is selected:
+                if (
+                    self._loaded_artifact.execution_identity() == binding.execution_identity()
+                    and self._loaded_adapter is selected
+                ):
                     lease_id = self._leases.setdefault(owner, new_id("lease"))
                     result = LoadResult(
-                        artifact=binding,
+                        artifact=self._loaded_artifact,
                         engine=selected.identity(),
                         lifecycle_state=self._state,
                         lease_id=lease_id,
                         consumer_id=owner,
                         reused=True,
-                        raw={"loaded_once": True},
+                        raw={
+                            "loaded_once": True,
+                            "loaded_artifact_identity": self._loaded_artifact.execution_identity(),
+                        },
                     )
                     return result.to_dict()
                 raise LoadConflictError(
                     "a different artifact is already loaded; release all existing leases before switching",
                     details={
-                        "loaded_artifact_id": self._loaded_artifact.artifact_id,
-                        "requested_artifact_id": binding.artifact_id,
+                        "loaded_artifact": self._loaded_artifact.to_dict(),
+                        "requested_artifact": binding.to_dict(),
                         "active_request_ids": list(self._active),
                         "lease_owners": sorted(self._leases),
                     },
@@ -284,7 +326,9 @@ class RuntimeCore:
             )
         return loaded, selected, owner
 
-    def _begin(self, request: GenerationRequest) -> tuple[ModelArtifactBinding, EngineAdapter, threading.Event, ExecutionTrace]:
+    def _begin(
+        self, request: GenerationRequest
+    ) -> tuple[ModelArtifactBinding, EngineAdapter, threading.Event, threading.Event, ExecutionTrace]:
         with self._lock:
             loaded, selected, _ = self._authorize_request(request)
             if self._active:
@@ -305,12 +349,58 @@ class RuntimeCore:
                 started_at=utc_now(),
             )
             cancel_event = threading.Event()
-            self._active[request.request_id] = _ActiveRequest(request, cancel_event, selected, trace)
-            return loaded, selected, cancel_event, trace
+            timeout_event = threading.Event()
+            active = _ActiveRequest(request, cancel_event, timeout_event, selected, trace)
+            self._active[request.request_id] = active
+            if request.timeout_ms is not None:
+                timer = threading.Timer(
+                    request.timeout_ms / 1000,
+                    self._request_timeout,
+                    args=(request.request_id,),
+                )
+                timer.daemon = True
+                active.timeout_timer = timer
+                timer.start()
+            return loaded, selected, cancel_event, timeout_event, trace
+
+    def _request_timeout(self, request_id: str) -> None:
+        with self._lock:
+            active = self._active.get(request_id)
+        if active is None:
+            return
+        active.timeout_event.set()
+        active.cancel_event.set()
+        try:
+            active.adapter.cancel(request_id)
+        except Exception:
+            # The adapter's cooperative cancellation hook must not prevent the
+            # Core from recording the timeout.
+            pass
+
+    @staticmethod
+    def _timeout_error(request: GenerationRequest, trace: ExecutionTrace) -> RuntimeTimeoutError:
+        return RuntimeTimeoutError(
+            "generation exceeded timeout_ms",
+            details={
+                "request_id": request.request_id,
+                "timeout_ms": request.timeout_ms,
+                "execution_id": trace.execution_id,
+                "timeout_semantics": "cooperative",
+            },
+        )
+
+    @staticmethod
+    def _raise_if_timed_out(
+        request: GenerationRequest, timeout_event: threading.Event, trace: ExecutionTrace
+    ) -> None:
+        if timeout_event.is_set():
+            raise RuntimeCore._timeout_error(request, trace)
 
     def _end(self, request_id: str) -> None:
         with self._lock:
-            self._active.pop(request_id, None)
+            active = self._active.pop(request_id, None)
+            if active is not None and active.timeout_timer is not None:
+                active.timeout_timer.cancel()
             if self._state == LifecycleState.GENERATING and self._loaded_artifact is not None:
                 self._state = LifecycleState.LOADED
 
@@ -326,12 +416,14 @@ class RuntimeCore:
         self._save_trace(trace)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
-        _, selected, cancel_event, trace = self._begin(request)
+        _, selected, cancel_event, timeout_event, trace = self._begin(request)
         try:
             resolution: RuntimeSettingsResolution = selected.resolve_runtime_options(request.runtime_options)
+            self._raise_if_timed_out(request, timeout_event, trace)
             trace.effective_runtime_settings = resolution.effective.to_dict()
             effective_request = replace(request, runtime_options=resolution.effective)
             result = selected.generate(effective_request, cancel_event)
+            self._raise_if_timed_out(request, timeout_event, trace)
             if result.metrics.load_duration_ms is None:
                 result.metrics.load_duration_ms = self._last_load_duration_ms
             if result.metrics.unload_duration_ms is None:
@@ -347,6 +439,8 @@ class RuntimeCore:
             self._last_error = None
             return result
         except RuntimeFoundationError as exc:
+            if timeout_event.is_set() and exc.code in {"cancelled", "engine_runtime_error"}:
+                exc = self._timeout_error(request, trace)
             trace.status = "cancelled" if exc.code == "cancelled" else "error"
             exc.details.setdefault("execution_id", trace.execution_id)
             trace.error = error_payload(exc, execution_id=trace.execution_id)
@@ -365,19 +459,23 @@ class RuntimeCore:
             self._end(request.request_id)
 
     def stream(self, request: GenerationRequest) -> Iterator[StreamEvent]:
-        _, selected, cancel_event, trace = self._begin(request)
+        _, selected, cancel_event, timeout_event, trace = self._begin(request)
 
         def iterator() -> Iterator[StreamEvent]:
             sequence = 0
             completed = False
+            terminal_error = False
             try:
                 yield StreamEvent(type="started", request_id=request.request_id, sequence=sequence)
                 resolution = selected.resolve_runtime_options(request.runtime_options)
+                self._raise_if_timed_out(request, timeout_event, trace)
                 trace.effective_runtime_settings = resolution.effective.to_dict()
                 effective_request = replace(request, runtime_options=resolution.effective)
                 for event in selected.stream(effective_request, cancel_event):
                     if event.type == "started":
                         continue
+                    if event.type == "completed" and timeout_event.is_set():
+                        raise self._timeout_error(request, trace)
                     sequence += 1
                     if event.type == "completed" and event.result is not None:
                         result_payload = dict(event.result)
@@ -395,7 +493,10 @@ class RuntimeCore:
                         event.result = result_payload
                         completed = True
                     elif event.type == "error":
+                        terminal_error = True
                         error = dict(event.error or {})
+                        if timeout_event.is_set() and error.get("code") == "cancelled":
+                            error = error_payload(self._timeout_error(request, trace))
                         error.setdefault("details", {})["execution_id"] = trace.execution_id
                         event.error = error
                         trace.status = "cancelled" if error.get("code") == "cancelled" else "error"
@@ -403,7 +504,11 @@ class RuntimeCore:
                         trace.finished_at = utc_now()
                     event.sequence = sequence
                     yield event
+                if not terminal_error:
+                    self._raise_if_timed_out(request, timeout_event, trace)
             except RuntimeFoundationError as exc:
+                if timeout_event.is_set() and exc.code in {"cancelled", "engine_runtime_error"}:
+                    exc = self._timeout_error(request, trace)
                 trace.status = "cancelled" if exc.code == "cancelled" else "error"
                 trace.error = error_payload(exc, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
@@ -430,7 +535,7 @@ class RuntimeCore:
                 )
             finally:
                 if not completed and trace.status == "running":
-                    trace.status = "cancelled" if cancel_event.is_set() else "abandoned"
+                    trace.status = "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
                     trace.finished_at = utc_now()
                 self._finish_trace(trace)
                 self._end(request.request_id)

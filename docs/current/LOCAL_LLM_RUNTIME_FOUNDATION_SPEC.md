@@ -38,6 +38,8 @@ Consumer Studio
 
 The selected boundary is `package + optional service facade`, with the service as the normal multi-consumer path. A shared Python package alone cannot safely own one model allocation across three independent processes. A distributed architecture is unnecessary for v1.
 
+When a load request omits an engine, the Core resolves the artifact format to its real engine (`mlx`/`safetensors` to MLX and `gguf` to llama.cpp). An unavailable mapped engine is an error; Mock is never a generic fallback and is usable only when explicitly requested. The unauthenticated service is loopback-only in v1.
+
 | Option | Decision | Reason |
 | --- | --- | --- |
 | Shared Python package only | Not the default | No single process owns model memory or unload conflicts across consumers. |

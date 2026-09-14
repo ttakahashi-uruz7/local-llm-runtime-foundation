@@ -51,11 +51,15 @@ Every top-level response includes `contract_version`. Contract payloads are JSON
 
 `requested_runtime_settings` and `effective_runtime_settings` are separate fields. An adapter may resolve `acceleration.backend=auto` to `metal` or `cpu`; the resolution is recorded. Unsupported or unavailable options produce an explicit error or capability status. Silent fallback is not allowed.
 
+`context.context_length` is an execution budget, not a silent model reconfiguration. Foundation counts prompt tokens using the selected adapter and enforces `prompt_tokens + max_tokens <= context_length` before and during generation. A violation returns `context_length_exceeded`; Foundation never truncates the prompt or silently reduces the generation budget. MLX advertises this option as a Foundation preflight budget because upstream `mlx-lm` does not expose a generic context-length keyword on `stream_generate`.
+
+`GenerationRequest.timeout_ms` is a cooperative timeout. Foundation starts a deadline, signals the adapter cancellation hook when it expires, and returns `runtime_timeout` with `timeout_semantics=cooperative`. An adapter must check the cancellation/deadline between engine output steps. A blocking engine call may only return after the engine yields control; v1 does not claim hard thread termination.
+
 Foundation can execute quantized KV settings when an adapter supports them. Whether that setting is acceptable for a consumer's Max Quality policy is outside this contract.
 
 ## Raw metrics
 
-The metrics payload can include load/unload duration, cold/warm TTFT, prefill tokens and duration, prefill/generation throughput, completion tokens, process/peak memory, memory pressure, swap before/after/delta, context length, engine failure classification, Metal allocation failure, context failure, timeout, cancellation, and cleanup status. Missing observations are `null` or an explicit `unavailable` provenance; they are not inferred.
+The metrics payload can include load/unload duration, cold/warm TTFT, prefill tokens and duration, prefill/generation throughput, completion tokens, current process RSS (`process_memory_bytes`), observed engine peak memory (`peak_memory_bytes`), memory pressure, swap before/after/delta, context length, engine failure classification, Metal allocation failure, context failure, timeout, cancellation, and cleanup status. `process_memory_bytes` is never populated from a peak-only counter such as Unix `ru_maxrss`; if current RSS is unavailable it is `null`. Missing observations are `null` or an explicit `unavailable` provenance; they are not inferred.
 
 ## Error shape
 
@@ -71,7 +75,7 @@ The metrics payload can include load/unload duration, cold/warm TTFT, prefill to
 }
 ```
 
-Important error codes include `artifact_not_found`, `engine_unavailable`, `engine_runtime_error`, `model_not_loaded`, `runtime_busy`, `load_conflict`, `unload_conflict`, `unsupported_runtime_option`, `invalid_runtime_option`, `unsupported_generation_setting`, `cancelled`, and `runtime_timeout`.
+Important error codes include `artifact_not_found`, `engine_not_found`, `engine_unavailable`, `engine_runtime_error`, `context_length_exceeded`, `model_not_loaded`, `runtime_busy`, `load_conflict`, `unload_conflict`, `unsupported_runtime_option`, `invalid_runtime_option`, `unsupported_generation_setting`, `cancelled`, and `runtime_timeout`.
 
 ## Stream
 

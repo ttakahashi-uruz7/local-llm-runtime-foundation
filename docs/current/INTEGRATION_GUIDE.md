@@ -16,6 +16,10 @@ Foundation Client → Local Runtime Service → Foundation Core → Adapter
 
 Start one local Foundation service per local runtime authority. Consumers identify themselves with a stable `consumer_id`, retain the returned `lease_id`, and include those values in later generation/unload calls.
 
+When `engine` is omitted on load, Foundation resolves only the engine mapped to the artifact format (`mlx`/`safetensors` → MLX, `gguf` → llama.cpp). An unavailable mapped engine returns `engine_unavailable`; unknown formats return `engine_not_found`. Mock is available only when the consumer explicitly requests `engine="mock"` and is always marked as simulated.
+
+The unauthenticated v1 service binds to loopback only: `127.0.0.1`, `::1`, or `localhost`. `RUNTIME_FOUNDATION_HOST` rejects `0.0.0.0` and LAN/external addresses. Remote service access is a future authenticated/TLS milestone.
+
 Foundation does not know a consumer's registry record, quality policy, or production profile. A consumer should store the returned execution trace in its own evidence system if it needs durable lineage.
 
 ## Benchmark Studio

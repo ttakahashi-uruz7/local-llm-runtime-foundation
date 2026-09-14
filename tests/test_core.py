@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,11 @@ import pytest
 from runtime_foundation import GenerationRequest, HostProfile, ModelArtifactBinding, RuntimeCore, RuntimeOptions
 from runtime_foundation.errors import (
     ArtifactNotFoundError,
+    ContextLengthExceededError,
+    EngineNotFoundError,
     EngineUnavailableError,
+    LoadConflictError,
+    RuntimeTimeoutError,
     UnsupportedRuntimeOptionError,
 )
 
@@ -59,6 +64,81 @@ def test_missing_artifact_and_engine_unavailable_are_explicit(tmp_path: Path) ->
     assert core.health()["status"] == "error"
 
 
+def test_omitted_engine_never_falls_back_to_mock(tmp_path: Path) -> None:
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"mlx-shaped fixture")
+    mlx_artifact = ModelArtifactBinding("mlx-artifact", str(model), "safetensors")
+    core = RuntimeCore(host_profile=HostProfile.mock_windows())
+
+    with pytest.raises(EngineUnavailableError) as unavailable:
+        core.load(mlx_artifact)
+    assert unavailable.value.details["engine"] == "mlx"
+    assert unavailable.value.details["engine"] != "mock"
+
+    unknown = replace(mlx_artifact, artifact_id="unknown", format="unknown")
+    with pytest.raises(EngineNotFoundError):
+        core.load(unknown)
+
+    explicit_mock = RuntimeCore(host_profile=HostProfile.mock_windows())
+    loaded = explicit_mock.load(mlx_artifact, adapter="mock")
+    assert loaded["engine"]["engine"] == "mock"
+
+
+def test_artifact_reuse_requires_full_execution_identity(tmp_path: Path) -> None:
+    core, artifact = build_core(tmp_path)
+    core.load(artifact, adapter="mock")
+    alternate_path = tmp_path / "other-model.bin"
+    alternate_path.write_bytes(b"different fixture")
+
+    variants = (
+        replace(artifact, artifact_hash="sha256:other"),
+        replace(artifact, local_path=str(alternate_path)),
+        replace(artifact, revision="revision-2"),
+    )
+    for variant in variants:
+        with pytest.raises(LoadConflictError):
+            core.load(variant, adapter="mock")
+
+    loaded_binding = replace(artifact, metadata={"authority": "loaded"})
+    fresh = RuntimeCore(host_profile=HostProfile.mock_windows())
+    fresh.load(loaded_binding, adapter="mock")
+    requested_with_new_metadata = replace(loaded_binding, metadata={"authority": "request"})
+    reused = fresh.load(requested_with_new_metadata, adapter="mock")
+    assert reused["reused"] is True
+    assert reused["artifact"] == loaded_binding.to_dict()
+    assert reused["raw"]["loaded_artifact_identity"] == loaded_binding.execution_identity()
+
+
+def test_context_length_budget_is_enforced(tmp_path: Path) -> None:
+    core, artifact = build_core(tmp_path)
+    core.load(artifact, adapter="mock")
+    request = GenerationRequest(
+        model_artifact_id=artifact.artifact_id,
+        messages=[{"role": "user", "content": "one two"}],
+        max_tokens=3,
+        runtime_options=RuntimeOptions.from_payload({"context": {"context_length": 4}}),
+    )
+    with pytest.raises(ContextLengthExceededError) as caught:
+        core.generate(request)
+    assert caught.value.details["requested_total_tokens"] == 5
+    assert caught.value.details["enforcement"] == "preflight"
+
+
+def test_timeout_is_cooperative_and_reaches_runtime_timeout(tmp_path: Path) -> None:
+    core, artifact = build_core(tmp_path)
+    core.load(artifact, adapter="mock")
+    request = GenerationRequest(
+        model_artifact_id=artifact.artifact_id,
+        messages=[{"role": "user", "content": "timeout this generated response"}],
+        timeout_ms=5,
+        runtime_options=RuntimeOptions.from_payload({"engine_options": {"mock.chunk_delay_ms": 20}}),
+    )
+    with pytest.raises(RuntimeTimeoutError) as caught:
+        core.generate(request)
+    assert caught.value.details["timeout_semantics"] == "cooperative"
+    assert core.health()["lifecycle_state"] == "LOADED"
+
+
 def test_requested_and_effective_options_and_unsupported_option(tmp_path: Path) -> None:
     core, artifact = build_core(tmp_path)
     core.load(artifact, adapter="mock")
@@ -85,6 +165,16 @@ def test_requested_and_effective_options_and_unsupported_option(tmp_path: Path) 
         )
     assert caught.value.details["execution_id"]
     assert core.health()["lifecycle_state"] == "LOADED"
+
+    with pytest.raises(UnsupportedRuntimeOptionError) as prompt_cache_error:
+        core.generate(
+            GenerationRequest(
+                model_artifact_id=artifact.artifact_id,
+                messages=[{"role": "user", "content": "prompt cache"}],
+                runtime_options=RuntimeOptions.from_payload({"prompt_cache": {"enabled": True}}),
+            )
+        )
+    assert prompt_cache_error.value.details["path"] == "prompt_cache.enabled"
 
 
 def test_stream_and_cancel_leave_loaded_state_consistent(tmp_path: Path) -> None:

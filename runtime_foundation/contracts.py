@@ -400,6 +400,23 @@ class ModelArtifactBinding:
             "metadata": dict(self.metadata),
         }
 
+    def execution_identity(self) -> dict[str, Any]:
+        """Return the fields that identify the artifact actually loaded for execution.
+
+        Metadata is descriptive consumer data and is intentionally not part of
+        the execution identity. The path, format, quantization, hash, and
+        revision are the lineage-bearing fields used for load reuse decisions.
+        """
+
+        return {
+            "artifact_id": self.artifact_id,
+            "local_path": self.local_path,
+            "format": self.format,
+            "quantization": self.quantization,
+            "artifact_hash": self.artifact_hash,
+            "revision": self.revision,
+        }
+
 
 @dataclass(frozen=True)
 class EngineIdentity:

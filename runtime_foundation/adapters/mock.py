@@ -27,9 +27,11 @@ from ..contracts import (
 )
 from ..errors import (
     ArtifactNotFoundError,
+    ContextLengthExceededError,
     EngineRuntimeError,
     InvalidRuntimeOptionError,
     RequestCancelledError,
+    RuntimeTimeoutError,
     UnsupportedRuntimeOptionError,
 )
 from .base import EngineAdapter
@@ -64,6 +66,16 @@ class MockAdapter(EngineAdapter):
             "mode": "simulated",
             "supported_values": ["auto", "cpu"],
         }
+        for path in (
+            "context.sliding_window",
+            "kv_cache.cache_limit_bytes",
+            "prompt_cache.enabled",
+            "prompt_cache.max_entries",
+            "prompt_cache.max_size_tokens",
+            "acceleration.device",
+            "acceleration.threads",
+        ):
+            runtime_options[path] = {"status": "unsupported", "reason": "Mock does not simulate this behavior"}
         runtime_options["engine_options"] = {"status": "supported", "options": self._engine_options}
         generation_options = {
             name: {"status": "supported", "mode": "simulated"}
@@ -121,6 +133,26 @@ class MockAdapter(EngineAdapter):
             raise UnsupportedRuntimeOptionError(
                 "Mock supports only auto or cpu acceleration",
                 details={"path": "acceleration.backend", "value": requested.acceleration.backend},
+            )
+        unsupported_values = {
+            "context.sliding_window": requested.context.sliding_window,
+            "kv_cache.cache_limit_bytes": requested.kv_cache.cache_limit_bytes,
+            "prompt_cache.enabled": requested.prompt_cache.enabled,
+            "prompt_cache.max_entries": requested.prompt_cache.max_entries,
+            "prompt_cache.max_size_tokens": requested.prompt_cache.max_size_tokens,
+            "acceleration.device": requested.acceleration.device,
+            "acceleration.threads": requested.acceleration.threads,
+        }
+        for path, value in unsupported_values.items():
+            if value not in {None, False}:
+                raise UnsupportedRuntimeOptionError(
+                    f"Mock does not simulate {path}",
+                    details={"path": path, "value": value},
+                )
+        if requested.prefill.batch_size not in {None, 1}:
+            raise UnsupportedRuntimeOptionError(
+                "Mock simulates only prefill.batch_size=1",
+                details={"path": "prefill.batch_size", "value": requested.prefill.batch_size},
             )
         unknown = sorted(set(requested.engine_options) - set(self._engine_options))
         if unknown:
@@ -225,6 +257,24 @@ class MockAdapter(EngineAdapter):
         return max(1, sum(len(message["content"].split()) for message in request.messages))
 
     @staticmethod
+    def _enforce_context_budget(request: GenerationRequest, prompt_tokens: int) -> None:
+        context_length = request.runtime_options.context.context_length
+        if context_length is None:
+            return
+        requested_total = prompt_tokens + request.max_tokens
+        if requested_total > context_length:
+            raise ContextLengthExceededError(
+                "prompt tokens plus generation budget exceed context.context_length",
+                details={
+                    "context_length": context_length,
+                    "prompt_tokens": prompt_tokens,
+                    "max_tokens": request.max_tokens,
+                    "requested_total_tokens": requested_total,
+                    "enforcement": "preflight",
+                },
+            )
+
+    @staticmethod
     def _from_result_payload(payload: dict[str, Any]) -> GenerationResult:
         metrics_payload = dict(payload["metrics"])
         metrics_payload.pop("contract_version", None)
@@ -250,12 +300,17 @@ class MockAdapter(EngineAdapter):
             self._active[request.request_id] = cancel_event
         started_monotonic = time.perf_counter()
         started_at = utc_now()
+        prompt_tokens = self._prompt_tokens(request)
+        self._enforce_context_budget(request, prompt_tokens)
+        timeout_deadline = (
+            time.monotonic() + request.timeout_ms / 1000 if request.timeout_ms is not None else None
+        )
         metrics = RuntimeMetrics(
             started_at=started_at,
             measurement_kind="mock",
             measurement_provenance="simulated",
             context_length=request.runtime_options.context.context_length,
-            prefill_tokens=self._prompt_tokens(request),
+            prefill_tokens=prompt_tokens,
         )
         text = self._render(request)
         chunks = text.split(" ") if text else []
@@ -263,6 +318,22 @@ class MockAdapter(EngineAdapter):
         try:
             yield StreamEvent(type="started", request_id=request.request_id, sequence=0)
             for index, word in enumerate(chunks, start=1):
+                if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                    metrics.timeout = True
+                    metrics.finished_at = utc_now()
+                    metrics.finish_reason = "timeout"
+                    self._last_metrics = metrics.to_dict()
+                    yield StreamEvent(
+                        type="error",
+                        request_id=request.request_id,
+                        sequence=index,
+                        done=True,
+                        error=RuntimeTimeoutError(
+                            "generation exceeded timeout_ms",
+                            details={"timeout_ms": request.timeout_ms, "timeout_semantics": "cooperative"},
+                        ).as_dict(),
+                    )
+                    return
                 if cancel_event.is_set():
                     metrics.cancellation = True
                     metrics.finished_at = utc_now()
@@ -284,6 +355,22 @@ class MockAdapter(EngineAdapter):
                 delay_ms = request.runtime_options.engine_options.get("mock.chunk_delay_ms", 1)
                 if delay_ms:
                     time.sleep(float(delay_ms) / 1000)
+            if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                metrics.timeout = True
+                metrics.finished_at = utc_now()
+                metrics.finish_reason = "timeout"
+                self._last_metrics = metrics.to_dict()
+                yield StreamEvent(
+                    type="error",
+                    request_id=request.request_id,
+                    sequence=len(emitted) + 1,
+                    done=True,
+                    error=RuntimeTimeoutError(
+                        "generation exceeded timeout_ms",
+                        details={"timeout_ms": request.timeout_ms, "timeout_semantics": "cooperative"},
+                    ).as_dict(),
+                )
+                return
             finished_at = utc_now()
             elapsed_ms = (time.perf_counter() - started_monotonic) * 1000
             metrics.finished_at = finished_at
@@ -327,6 +414,13 @@ class MockAdapter(EngineAdapter):
                 code = (event.error or {}).get("code")
                 if code == "cancelled":
                     raise RequestCancelledError("generation was cancelled")
+                if code == "runtime_timeout":
+                    timeout_details = dict((event.error or {}).get("details") or {})
+                    timeout_details.setdefault("timeout_semantics", "cooperative")
+                    raise RuntimeTimeoutError(
+                        "generation exceeded timeout_ms",
+                        details=timeout_details,
+                    )
                 raise EngineRuntimeError("Mock generation failed", details=event.error or {})
         if completed is None:
             raise EngineRuntimeError("Mock generation ended without a result")

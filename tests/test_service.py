@@ -3,10 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from runtime_foundation import HostProfile, ModelArtifactBinding, RuntimeCore
-from runtime_foundation.service import create_app
+from runtime_foundation.service import create_app, validate_loopback_host
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "127.0.0.2"])
+def test_service_bind_host_accepts_loopback(host: str) -> None:
+    assert validate_loopback_host(host) == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "8.8.8.8", "example.local"])
+def test_service_bind_host_rejects_non_loopback(host: str) -> None:
+    with pytest.raises(ValueError, match="loopback"):
+        validate_loopback_host(host)
 
 
 def test_service_api_exposes_contract_version_and_raw_runtime_boundary(tmp_path: Path) -> None:

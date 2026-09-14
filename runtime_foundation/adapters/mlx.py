@@ -33,10 +33,12 @@ from ..contracts import (
 )
 from ..errors import (
     ArtifactNotFoundError,
+    ContextLengthExceededError,
     EngineRuntimeError,
     EngineUnavailableError,
     InvalidRuntimeOptionError,
     RequestCancelledError,
+    RuntimeTimeoutError,
     UnsupportedGenerationSettingError,
     UnsupportedRuntimeOptionError,
 )
@@ -137,7 +139,11 @@ class MLXAdapter(EngineAdapter):
             return {"status": "unavailable", "reason": message}
 
         runtime_options = {
-            "context.context_length": supported(),
+            "context.context_length": {
+                "status": "supported",
+                "mode": "foundation-preflight-budget",
+                "enforcement": "prompt_tokens_plus_max_tokens",
+            },
             "context.sliding_window": unavailable("mlx-lm does not expose a sliding-window option"),
             "kv_cache.mode": {"status": "supported", "supported_values": ["auto", "full_precision", "quantized"]},
             "kv_cache.precision": supported(),
@@ -156,7 +162,7 @@ class MLXAdapter(EngineAdapter):
             "acceleration.backend": {"status": "supported", "supported_values": ["auto", "metal"]},
             "acceleration.device": unavailable("mlx-lm selects the Metal device internally"),
             "acceleration.threads": unavailable("MLX uses Metal device scheduling"),
-            "engine_options": {"status": "supported", "options": {}},
+            "engine_options": {"status": "unsupported", "reason": "no engine-specific options are registered"},
         }
         generation_options = {
             "max_tokens": {"status": "supported"},
@@ -365,6 +371,31 @@ class MLXAdapter(EngineAdapter):
             return tokenizer.decode(rendered)
         raise EngineRuntimeError("MLX tokenizer returned an unsupported chat-template value")
 
+    @staticmethod
+    def _enforce_context_budget(request: GenerationRequest, prompt_tokens: int) -> None:
+        context_length = request.runtime_options.context.context_length
+        if context_length is None:
+            return
+        requested_total = prompt_tokens + request.max_tokens
+        if requested_total > context_length:
+            raise ContextLengthExceededError(
+                "prompt tokens plus generation budget exceed context.context_length",
+                details={
+                    "context_length": context_length,
+                    "prompt_tokens": prompt_tokens,
+                    "max_tokens": request.max_tokens,
+                    "requested_total_tokens": requested_total,
+                    "enforcement": "preflight",
+                },
+            )
+
+    @staticmethod
+    def _timeout_error(request: GenerationRequest) -> RuntimeTimeoutError:
+        return RuntimeTimeoutError(
+            "generation exceeded timeout_ms",
+            details={"timeout_ms": request.timeout_ms, "timeout_semantics": "cooperative"},
+        )
+
     def _stream_kwargs(self, request: GenerationRequest, options: RuntimeOptions, mlx_lm: Any) -> dict[str, Any]:
         stream_generate = getattr(mlx_lm, "stream_generate")
         parameters = self._signature(stream_generate)
@@ -432,16 +463,34 @@ class MLXAdapter(EngineAdapter):
         before = runtime_snapshot()
         prompt = self._prompt(request, tokenizer)
         prompt_tokens = max(1, len(getattr(tokenizer, "encode", lambda value: value.split())(prompt)))
+        self._enforce_context_budget(request, prompt_tokens)
+        timeout_deadline = (
+            time.monotonic() + request.timeout_ms / 1000 if request.timeout_ms is not None else None
+        )
         text_parts: list[str] = []
         last_item: Any = None
         try:
             yield StreamEvent(type="started", request_id=request.request_id, sequence=0)
             iterator = stream_generate(model, tokenizer, prompt, **self._stream_kwargs(request, request.runtime_options, mlx_lm))
             for sequence, item in enumerate(iterator, start=1):
+                if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                    metrics.timeout = True
+                    metrics.finished_at = utc_now()
+                    metrics.finish_reason = "timeout"
+                    self._last_metrics = metrics.to_dict()
+                    yield StreamEvent(
+                        type="error",
+                        request_id=request.request_id,
+                        sequence=sequence,
+                        done=True,
+                        error=self._timeout_error(request).as_dict(),
+                    )
+                    return
                 if cancel_event.is_set():
                     metrics.cancellation = True
                     metrics.finished_at = utc_now()
                     metrics.finish_reason = "cancelled"
+                    self._last_metrics = metrics.to_dict()
                     yield StreamEvent(
                         type="error",
                         request_id=request.request_id,
@@ -459,6 +508,19 @@ class MLXAdapter(EngineAdapter):
                         metrics.cold_ttft_ms = (time.perf_counter() - started_monotonic) * 1000
                     text_parts.append(delta)
                     yield StreamEvent(type="delta", request_id=request.request_id, sequence=sequence, delta=delta)
+            if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                metrics.timeout = True
+                metrics.finished_at = utc_now()
+                metrics.finish_reason = "timeout"
+                self._last_metrics = metrics.to_dict()
+                yield StreamEvent(
+                    type="error",
+                    request_id=request.request_id,
+                    sequence=len(text_parts) + 1,
+                    done=True,
+                    error=self._timeout_error(request).as_dict(),
+                )
+                return
             after = runtime_snapshot()
             metrics.finished_at = utc_now()
             metrics.prefill_tokens = self._item_value(last_item, "prompt_tokens", prompt_tokens) or prompt_tokens
@@ -474,7 +536,7 @@ class MLXAdapter(EngineAdapter):
                 metrics.generation_tokens_per_second = float(generation_tps)
                 metrics.generation_duration_ms = metrics.completion_tokens / float(generation_tps) * 1000
             metrics.process_memory_bytes = after.get("process_memory_bytes")
-            metrics.peak_memory_bytes = int(float(peak_memory) * 1_000_000_000) if isinstance(peak_memory, (int, float)) else metrics.process_memory_bytes
+            metrics.peak_memory_bytes = int(float(peak_memory) * 1_000_000_000) if isinstance(peak_memory, (int, float)) else None
             unified = after.get("unified_memory_bytes")
             if isinstance(unified, int) and unified > 0 and isinstance(metrics.peak_memory_bytes, int):
                 metrics.extra["peak_memory_ratio"] = metrics.peak_memory_bytes / unified
@@ -527,6 +589,13 @@ class MLXAdapter(EngineAdapter):
             elif event.type == "error":
                 if (event.error or {}).get("code") == "cancelled":
                     raise RequestCancelledError("generation was cancelled")
+                if (event.error or {}).get("code") == "runtime_timeout":
+                    timeout_details = dict((event.error or {}).get("details") or {})
+                    timeout_details.setdefault("timeout_semantics", "cooperative")
+                    raise RuntimeTimeoutError(
+                        "generation exceeded timeout_ms",
+                        details=timeout_details,
+                    )
                 raise EngineRuntimeError("MLX generation failed", details=event.error or {})
         if completed is None:
             raise EngineRuntimeError("MLX generation ended without a result")
