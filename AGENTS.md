@@ -49,9 +49,39 @@ Never switch silently to PATH/system Git. Do not use force push, reset --hard, g
 
 The Benchmark reference PR #10 remains open. This repository must not close, merge, or repurpose that PR.
 
+## Autonomous PR workflow
+
+For ordinary implementation, fix, refactor, migration, and documentation tasks, the standard autonomous scope runs through Pull Request update. Treat the following as pre-approved repository work and do not request an individual user confirmation for them:
+
+- Create or update a work branch.
+- Edit files, stage changes, and create commits.
+- Push a work branch.
+- Create a Pull Request.
+- Update an existing Pull Request with follow-up commits.
+- Run normal CI and repository validation.
+
+Branch push, Pull Request creation, and Pull Request updates are not an external-publication approval gate, a production deployment, or an irreversible operation. Do not stop with a message such as “GitHubへのPR作成は外部公開操作のため確認が必要です” or any equivalent request for approval. If work is tied to an existing Pull Request, continue updating that Pull Request; do not close it or create a replacement merely to avoid a follow-up update.
+
+The only normal user approval gate is merging to `main`. Never make a direct commit to `main`, merge a Pull Request, or merge to `main` unless the user explicitly instructs it with wording such as “mainにマージして”, “mergeして”, or equivalent. The `main` merge restriction must never be used as a reason to stop commits, pushes, Pull Request creation, or Pull Request updates.
+
+Do not speculate about GitHub permissions, OAuth scopes, or credentials and wait for confirmation. Attempt ordinary push, Pull Request creation, and Pull Request update first. Only an actual authentication, permission, or scope refusal is a blocker; investigate that refusal without force push, history rewrite, credential-setting changes, or scope bypasses.
+
+Choose the work branch and base from repository history, current specifications, existing Pull Requests, existing branches, and task scope whenever those facts make the choice safe. Do not ask the user to resolve routine branch/base ambiguity that repository investigation can resolve.
+
 ## Codex protocol
 
-All multi-step work is reported as `Step X/N`. If scope expands, update N. Investigate repository state and current specifications before asking routine design questions. Fix ordinary test failures, type errors, missing fixtures, and small contract decisions autonomously. Stop only for repository identity/permission/corruption, inseparable user changes, an unresolvable canonical contradiction, credential failure that prevents the requested Git operation, or a destructive-only solution.
+All multi-step work is reported as `Step X/N`. If scope expands, update N. Investigate repository state and current specifications before asking routine design questions. Fix ordinary test failures, type errors, missing fixtures, and small contract decisions autonomously. Do not treat the following as a HARD STOP or user confirmation gate: ordinary test failures, implementation bugs, type errors, lint failures, missing fixtures, additional test needs, documentation updates, commit creation, branch push, Pull Request creation, Pull Request updates, lack of separate permission for Pull Request creation, or the absence of a Mac Production Validation environment. Without a Mac, complete all safe Windows development, tests, commits, pushes, and Pull Request updates.
+
+The only HARD STOP conditions are:
+
+- Repository identity is unknown.
+- Repository corruption prevents safe work.
+- Existing user changes cannot be preserved while proceeding.
+- Canonical specifications contain an unresolvable contradiction.
+- An actual credential, authentication, or permission refusal prevents the requested Git operation.
+- The requested result can be achieved only through a destructive operation.
+
+If none of those conditions applies, complete the original request through Pull Request update.
 
 Before commit:
 
