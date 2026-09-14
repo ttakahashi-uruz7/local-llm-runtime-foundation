@@ -22,6 +22,8 @@ class RemoteRuntimeError(Exception):
         self.status_code = status_code
         self.code = str(error.get("code", "remote_runtime_error"))
         self.message = str(error.get("message", "remote runtime request failed"))
+        retryable = error.get("retryable", False)
+        self.retryable = retryable if isinstance(retryable, bool) else False
         self.details = dict(error.get("details") or {})
         super().__init__(self.message)
 

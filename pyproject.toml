@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-llm-runtime-foundation"
-version = "0.1.0"
+version = "0.1.1"
 description = "Policy-free local LLM execution foundation for MLX and future llama.cpp consumers"
 readme = "README.md"
 requires-python = ">=3.11"

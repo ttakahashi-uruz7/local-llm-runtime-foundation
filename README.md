@@ -31,10 +31,12 @@ The Windows development path uses `MockAdapter` only when the consumer explicitl
 
 `RuntimeSettingsResolution` is consumer-visible raw evidence. Successful generate results, streaming `completed` results, and `ExecutionTrace` expose the same requested/effective settings, `option_status`, and `warnings`; consumers must preserve these values rather than infer them. Unload preserves the adapter's raw `cleanup_status` (`clean` or `cleanup_error`) in `UnloadResult.raw`. `GenerationRequest.timeout_ms` remains a Foundation Core cooperative runtime timeout.
 
+The Python client preserves Foundation remote errors without policy reinterpretation: `RemoteRuntimeError` exposes the wire `code`, `message`, strict-boolean `retryable`, `details`, and HTTP `status_code`. Consumers must use the Foundation-provided retryability and must not reconstruct it from an error code.
+
 ## Contract and service
 
 - Contract version: `runtime-foundation.contract.v1`
-- Foundation version: `0.1.0`
+- Foundation version: `0.1.1`
 - Default local service: `http://127.0.0.1:8765`
 - Service bind is loopback-only (`127.0.0.1`, `::1`, or `localhost`); unauthenticated LAN/remote binding is rejected.
 - `GET /health`, `GET /host`, `GET /engines`

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from runtime_foundation import HostProfile, ModelArtifactBinding, RuntimeCore
 from runtime_foundation.adapters.mock import MockAdapter
+from runtime_foundation.client import LocalRuntimeClient, RemoteRuntimeError
 from runtime_foundation.errors import RequestCancelledError
 from runtime_foundation.service import create_app, validate_loopback_host
 
@@ -144,3 +145,34 @@ def test_service_exposes_core_timeout_as_http_504(tmp_path: Path) -> None:
     assert response.json()["error"]["code"] == "runtime_timeout"
     assert response.json()["error"]["details"]["execution_id"]
     assert client.get("/health").json()["last_error"]["code"] == "runtime_timeout"
+
+
+def test_client_service_round_trip_preserves_retryable_timeout(tmp_path: Path) -> None:
+    model = tmp_path / "client-service-timeout.bin"
+    model.write_bytes(b"client service timeout fixture")
+    artifact = ModelArtifactBinding("client-service-timeout", str(model), "bin")
+    core = RuntimeCore(
+        host_profile=HostProfile.mock_windows(),
+        adapters={"mock": ServiceTimeoutCancellationAdapter()},
+    )
+    service_client = TestClient(create_app(core))
+
+    with LocalRuntimeClient(http_client=service_client, base_url="http://127.0.0.1") as client:
+        loaded = client.load(artifact, engine="mock")
+        with pytest.raises(RemoteRuntimeError) as caught:
+            client.generate(
+                {
+                    "model_artifact_id": artifact.artifact_id,
+                    "lease_id": loaded["lease_id"],
+                    "messages": [{"role": "user", "content": "client service timeout"}],
+                    "timeout_ms": 5,
+                }
+            )
+
+    error = caught.value
+    assert error.status_code == 504
+    assert error.code == "runtime_timeout"
+    assert error.retryable is True
+    assert error.details["timeout_ms"] == 5
+    assert error.details["timeout_semantics"] == "cooperative"
+    assert error.details["execution_id"]

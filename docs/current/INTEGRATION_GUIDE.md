@@ -28,6 +28,10 @@ On a successful generate, and on the terminal `completed` event from streaming, 
 
 On unload, preserve `UnloadResult.raw.cleanup_status`. `clean` is a successful cleanup observation, `cleanup_error` is a failure observation, and a missing/unknown value is unresolved. Policy-owning consumers must not treat unresolved cleanup as a pass. `GenerationRequest.timeout_ms` remains a Foundation Core cooperative runtime deadline; an HTTP client timeout must not replace its `runtime_timeout` authority.
 
+### Remote error propagation
+
+The Python `LocalRuntimeClient` raises `RemoteRuntimeError` for Foundation error responses and preserves the wire `code`, `message`, strict-boolean `retryable`, `details`, and HTTP `status_code`. Consumers must use Foundation's retryability as raw authority and must not reconstruct it from an error code.
+
 ## Benchmark Studio
 
 Benchmark keeps:

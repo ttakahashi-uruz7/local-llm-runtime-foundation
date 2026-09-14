@@ -3,7 +3,7 @@
 - Document ID: `LLRF-SPEC-001`
 - Version: `1.0`
 - Status: **Canonical / Current**
-- Foundation version: `0.1.0`
+- Foundation version: `0.1.1`
 - Contract version: `runtime-foundation.contract.v1`
 - Development host: Windows
 - Production validation host: Apple Silicon Mac

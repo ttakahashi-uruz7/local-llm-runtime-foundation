@@ -52,5 +52,78 @@ def test_client_exposes_remote_error() -> None:
         except RemoteRuntimeError as exc:
             assert exc.status_code == 503
             assert exc.code == "engine_unavailable"
+            assert exc.retryable is False
         else:  # pragma: no cover
             raise AssertionError("expected RemoteRuntimeError")
+
+
+def test_client_preserves_retryable_runtime_timeout_error() -> None:
+    details = {"timeout_ms": 25, "timeout_semantics": "cooperative", "execution_id": "execution-timeout"}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            504,
+            json={
+                "error": {
+                    "code": "runtime_timeout",
+                    "message": "generation exceeded the runtime deadline",
+                    "retryable": True,
+                    "details": details,
+                }
+            },
+        )
+
+    with LocalRuntimeClient(http_client=httpx.Client(transport=httpx.MockTransport(handler)), base_url="http://127.0.0.1") as client:
+        with pytest.raises(RemoteRuntimeError) as caught:
+            client.generate({"messages": []})
+
+    error = caught.value
+    assert error.status_code == 504
+    assert error.code == "runtime_timeout"
+    assert error.message == "generation exceeded the runtime deadline"
+    assert error.retryable is True
+    assert error.details == details
+
+
+@pytest.mark.parametrize("wire_value", ["true", 1, None])
+def test_client_does_not_coerce_malformed_retryable(wire_value: object) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            504,
+            json={
+                "error": {
+                    "code": "runtime_timeout",
+                    "message": "timeout",
+                    "retryable": wire_value,
+                    "details": {"execution_id": "execution-malformed"},
+                }
+            },
+        )
+
+    with LocalRuntimeClient(http_client=httpx.Client(transport=httpx.MockTransport(handler)), base_url="http://127.0.0.1") as client:
+        with pytest.raises(RemoteRuntimeError) as caught:
+            client.generate({"messages": []})
+
+    assert caught.value.retryable is False
+
+
+def test_client_preserves_non_retryable_error() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "context budget exceeded",
+                    "retryable": False,
+                    "details": {"execution_id": "execution-context"},
+                }
+            },
+        )
+
+    with LocalRuntimeClient(http_client=httpx.Client(transport=httpx.MockTransport(handler)), base_url="http://127.0.0.1") as client:
+        with pytest.raises(RemoteRuntimeError) as caught:
+            client.generate({"messages": []})
+
+    assert caught.value.code == "context_length_exceeded"
+    assert caught.value.retryable is False
