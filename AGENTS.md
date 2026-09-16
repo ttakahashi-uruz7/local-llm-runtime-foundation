@@ -114,6 +114,7 @@ Before commit:
 4. Record Base SHA, final SHA, remote SHA, and clean status.
 
 ## Mac validation gate
+
 Before calling the Foundation MLX path production validated, run the current Mac runbook, record engine versions/builds, artifact binding, chat-template behavior, load/unload cleanup, cold/warm TTFT, prefill/generation metrics, process footprint, peak memory, memory pressure, swap, cancellation, and failure evidence. No Windows/Mock result can substitute for those observations.
 
 ## Canonical working repository boundary
