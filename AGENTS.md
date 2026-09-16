@@ -114,5 +114,12 @@ Before commit:
 4. Record Base SHA, final SHA, remote SHA, and clean status.
 
 ## Mac validation gate
-
 Before calling the Foundation MLX path production validated, run the current Mac runbook, record engine versions/builds, artifact binding, chat-template behavior, load/unload cleanup, cold/warm TTFT, prefill/generation metrics, process footprint, peak memory, memory pressure, swap, cancellation, and failure evidence. No Windows/Mock result can substitute for those observations.
+
+## Canonical working repository boundary
+
+- This repository's canonical working repository is `C:\Projects\local-llm-runtime-foundation`.
+- Perform changes only from the canonical path. Do not make changes from `C:\Users\user\Documents\ChatGPT`, any `RETIRED` repository, or a temporary clone.
+- At the start of each task, verify the repository root, `origin`, current branch, and HEAD SHA.
+- If the actual repository root does not match the canonical path, HARD STOP before making changes or Git operations.
+- Do not change the canonical path without explicit user instruction.
