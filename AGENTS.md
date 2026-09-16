@@ -118,8 +118,9 @@ Before calling the Foundation MLX path production validated, run the current Mac
 
 ## Canonical working repository boundary
 
-- This repository's canonical working repository is `C:\Projects\local-llm-runtime-foundation`.
-- Perform changes only from the canonical path. Do not make changes from `C:\Users\user\Documents\ChatGPT`, any `RETIRED` repository, or a temporary clone.
-- At the start of each task, verify the repository root, `origin`, current branch, and HEAD SHA.
-- If the actual repository root does not match the canonical path, HARD STOP before making changes or Git operations.
+- This repository's canonical working copy is `C:\Projects\local-llm-runtime-foundation` only.
+- Codex implementation, file changes, Git operations, tests, builds, launchers, and any other repository-targeting operation must run from the canonical working copy only.
+- Do not develop, run Git operations, tests, builds, or launchers from `C:\Users\user\Documents\ChatGPT`, a `RETIRED` repository, a temporary clone, a mirror, a backup clone, or any other non-canonical copy.
+- At the start of each task, verify the repository root, `origin`, current branch, and HEAD.
+- If the actual repository root does not match the canonical path, HARD STOP before making changes, Git operations, tests, builds, or launchers.
 - Do not change the canonical path without explicit user instruction.
