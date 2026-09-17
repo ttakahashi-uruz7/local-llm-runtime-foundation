@@ -68,6 +68,16 @@ Do not speculate about GitHub permissions, OAuth scopes, or credentials and wait
 
 Choose the work branch and base from repository history, current specifications, existing Pull Requests, existing branches, and task scope whenever those facts make the choice safe. Do not ask the user to resolve routine branch/base ambiguity that repository investigation can resolve.
 
+## GitHub operation transport policy
+
+- Do not perform GitHub repository operations through the GitHub website or browser UI. Browser-based GitHub controls must not be used for branch creation, push handoff, Pull Request creation/update, PR comments, review preparation, CI/status checks, merge preparation, or repository metadata changes.
+- Use the canonical Sourcetree Embedded Git for local Git operations. For GitHub remote operations, use non-browser mechanisms such as normal Git transport, GitHub CLI (`gh`) when available and authorized, GitHub API, or an authorized GitHub connector/tool.
+- Browser/UI confirmation prompts are not a normal approval gate and must not be introduced by voluntarily selecting a browser route. If an equivalent non-browser path exists, use it.
+- Branch creation, commit, push, Pull Request creation/update, PR body update, non-destructive PR comments, and CI/status inspection are pre-approved ordinary development operations and require no additional user confirmation.
+- Explicit user approval is required before: merge to `main`, Pull Request merge, merge-queue submission, enabling auto-merge, force-push/history rewrite, PR close/delete, branch deletion, repository/organization permission changes, or other destructive/irreversible operations.
+- If a non-browser GitHub operation is actually rejected by authentication, permission, OAuth/scope, or repository policy, investigate safe non-browser alternatives first. Do not switch to browser UI merely to bypass the rejection.
+- If no safe non-browser route remains, HARD STOP and report the exact attempted operation, transport/tool used, exact rejection reason, safe alternatives attempted, and why user action is technically required. Never describe model caution or a self-imposed confirmation as a platform-forced approval.
+
 ## PR Completion Gate / Definition of Done
 
 For every ordinary implementation, fix, refactor, migration, or documentation task that changes files, the complete unit of work is:
