@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .contracts import CONTRACT_VERSION, GenerationRequest, ModelArtifactBinding
+from .contracts_v2 import CONTRACT_V2_VERSION, ArtifactBindingV2, GenerationRequestV2
 from .core import RuntimeCore
 from .errors import InvalidRequestError, RuntimeFoundationError
 from .network import validate_loopback_host
@@ -19,8 +20,31 @@ from .version import FOUNDATION_VERSION
 def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding:
     candidate = body.get("artifact")
     if candidate is None:
-        candidate = {key: body[key] for key in ("artifact_id", "local_path", "format", "quantization", "artifact_hash", "revision", "metadata") if key in body}
+        candidate = {
+            key: body[key]
+            for key in (
+                "artifact_id",
+                "local_path",
+                "format",
+                "quantization",
+                "artifact_hash",
+                "revision",
+                "metadata",
+                "contract_version",
+                "registry_identity",
+                "content_identity",
+                "locator",
+            )
+            if key in body
+        }
     try:
+        if isinstance(candidate, dict) and (
+            candidate.get("contract_version") == CONTRACT_V2_VERSION
+            or "registry_identity" in candidate
+            or "content_identity" in candidate
+            or "locator" in candidate
+        ):
+            return ArtifactBindingV2.from_payload(candidate).to_legacy()
         return ModelArtifactBinding.from_payload(candidate)
     except (RuntimeFoundationError, ValueError) as exc:
         if isinstance(exc, RuntimeFoundationError):
@@ -30,6 +54,13 @@ def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding:
 
 def _generation_request(body: dict[str, Any]) -> GenerationRequest:
     try:
+        if (
+            body.get("contract_version") == CONTRACT_V2_VERSION
+            or body.get("schema_version") == "runtime-foundation.generation-request.v2"
+            or "thinking_intent" in body
+            or "execution_guard" in body
+        ):
+            return GenerationRequestV2.from_payload(body)
         return GenerationRequest.from_payload(body)
     except (RuntimeFoundationError, ValueError) as exc:
         if isinstance(exc, RuntimeFoundationError):

@@ -3,14 +3,19 @@
 - Document ID: `LLRF-SPEC-001`
 - Version: `1.0`
 - Status: **Canonical / Current**
-- Foundation version: `0.1.1`
-- Contract version: `runtime-foundation.contract.v1`
+- Foundation version: `0.2.0`
+- Contract versions: `runtime-foundation.contract.v1` and additive `runtime-foundation.contract.v2`
 - Development host: Windows
 - Production validation host: Apple Silicon Mac
 
 ## 1. Purpose
 
 The Foundation is the common low-level local execution authority shared by Novel Studio, Benchmark Studio, and Learning Studio. It answers **how a supplied local artifact was observed and executed**. It does not answer whether the artifact, settings, output, or deployment is good.
+
+RAH-1 adds explicit Artifact, Engine, Foundation, and Runtime Settings bindings
+under `runtime-foundation.contract.v2`; v1 consumers and historical v1 evidence
+remain unchanged. See `RAH1_CONTRACT_V2.md` for the additive execution binding
+and canonical fingerprint foundation.
 
 The Foundation is not a fourth Studio and is not a workbench.
 

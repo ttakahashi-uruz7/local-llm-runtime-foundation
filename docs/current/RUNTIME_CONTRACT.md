@@ -2,9 +2,19 @@
 
 - Status: **Canonical / Current**
 - Contract version: `runtime-foundation.contract.v1`
-- Foundation version: `0.1.1`
+- Foundation version: `0.2.0`
 
 Every top-level response includes `contract_version`. Contract payloads are JSON-safe and may be stored by a consumer as raw execution evidence. The Foundation does not persist a Benchmark profile.
+
+## Contract v2 compatibility
+
+`runtime-foundation.contract.v2` is additive to `runtime-foundation.contract.v1`.
+Existing v1 request/result/trace payloads remain supported, and historical v1
+evidence is not inferred-upgraded. `GET /health` exposes both values through
+`supported_contract_versions` (and the compatibility alias
+`supported_contracts`). See [RAH1_CONTRACT_V2.md](RAH1_CONTRACT_V2.md) for the
+Execution Binding, Artifact Binding, Engine Binding, Foundation Binding,
+effective settings fingerprint, Thinking v2, and Execution Guard foundations.
 
 ## First-class contracts
 

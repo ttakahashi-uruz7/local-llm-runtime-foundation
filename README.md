@@ -27,7 +27,7 @@ python -m pytest --basetemp=.pytest-temp
 python -m runtime_foundation
 ```
 
-The Windows development path uses `MockAdapter` only when the consumer explicitly requests `engine="mock"`. An MLX/GGUF artifact never silently falls back to Mock. MLX and Metal are imported lazily and are expected to be unavailable on Windows. Foundation v1 does not download models, commit weights, call cloud inference, or modify consumer configuration.
+The Windows development path uses `MockAdapter` only when the consumer explicitly requests `engine="mock"`. An MLX/GGUF artifact never silently falls back to Mock. MLX and Metal are imported lazily and are expected to be unavailable on Windows. Foundation does not download models, commit weights, call cloud inference, or modify consumer configuration.
 
 `RuntimeSettingsResolution` is consumer-visible raw evidence. Successful generate results, streaming `completed` results, and `ExecutionTrace` expose the same requested/effective settings, `option_status`, and `warnings`; consumers must preserve these values rather than infer them. Unload preserves the adapter's raw `cleanup_status` (`clean` or `cleanup_error`) in `UnloadResult.raw`. `GenerationRequest.timeout_ms` remains a Foundation Core cooperative runtime timeout.
 
@@ -36,7 +36,8 @@ The Python client preserves Foundation remote errors without policy reinterpreta
 ## Contract and service
 
 - Contract version: `runtime-foundation.contract.v1`
-- Foundation version: `0.1.1`
+- Supported contracts: `runtime-foundation.contract.v1`, `runtime-foundation.contract.v2`
+- Foundation version: `0.2.0`
 - Default local service: `http://127.0.0.1:8765`
 - Service bind is loopback-only (`127.0.0.1`, `::1`, or `localhost`); unauthenticated LAN/remote binding is rejected.
 - `GET /health`, `GET /host`, `GET /engines`
@@ -47,6 +48,8 @@ The Python client preserves Foundation remote errors without policy reinterpreta
 - `GET /runtime/metrics`, `GET /executions/{execution_id}`
 
 See [RUNTIME_CONTRACT.md](docs/current/RUNTIME_CONTRACT.md) and [INTEGRATION_GUIDE.md](docs/current/INTEGRATION_GUIDE.md).
+
+RAH-1 v2 details are in [RAH1_CONTRACT_V2.md](docs/current/RAH1_CONTRACT_V2.md). v2 separates registry artifact identity, complete/fast content identity, and locator; separates MLX engine family from `mlx-lm` implementation; binds Foundation and effective runtime settings; and exposes deterministic execution fingerprints. The Foundation remains policy-free. A second MLX runtime, real llama.cpp execution, LM Studio integration, and production performance conclusions are deferred.
 
 ## Repository history reference
 

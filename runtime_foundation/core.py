@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, ClassVar, cast
 
 from .adapters import EngineAdapter, LlamaCppAdapter, MLXAdapter, MockAdapter
 from .contracts import (
     CONTRACT_VERSION,
-    EngineCapability,
-    EngineIdentity,
     ExecutionTrace,
     GenerationRequest,
     GenerationResult,
@@ -20,12 +19,22 @@ from .contracts import (
     LifecycleState,
     LoadResult,
     ModelArtifactBinding,
-    RuntimeMetrics,
     RuntimeSettingsResolution,
     StreamEvent,
     UnloadResult,
     new_id,
     utc_now,
+)
+from .contracts_v2 import (
+    CONTRACT_V2_VERSION,
+    SUPPORTED_CONTRACT_VERSIONS,
+    ArtifactBindingV2,
+    ExecutionTraceV2,
+    GenerationRequestV2,
+    GenerationResultV2,
+    ThinkingIntent,
+    ThinkingResolution,
+    build_execution_binding,
 )
 from .errors import (
     ArtifactNotFoundError,
@@ -34,16 +43,15 @@ from .errors import (
     EngineUnavailableError,
     LoadConflictError,
     ModelNotLoadedError,
-    RequestCancelledError,
     RuntimeBusyError,
     RuntimeFoundationError,
     RuntimeTimeoutError,
     UnloadConflictError,
+    UnsupportedGenerationSettingError,
     error_payload,
 )
 from .host import HostProfile
 from .version import FOUNDATION_VERSION
-
 
 DEFAULT_CONSUMER_ID = "anonymous"
 
@@ -61,7 +69,7 @@ class _ActiveRequest:
 class RuntimeCore:
     """Own one loaded model process and expose engine-neutral operations."""
 
-    _ARTIFACT_ENGINE_MAP = {
+    _ARTIFACT_ENGINE_MAP: ClassVar[dict[str, str]] = {
         "mlx": "mlx",
         "safetensors": "mlx",
         "gguf": "llama.cpp",
@@ -73,8 +81,12 @@ class RuntimeCore:
         host_profile: HostProfile | None = None,
         adapters: dict[str, EngineAdapter] | None = None,
         foundation_version: str = FOUNDATION_VERSION,
+        foundation_build_identity: str | None = None,
     ) -> None:
         self.foundation_version = foundation_version
+        # Unknown build identities stay null; a package version is not a build
+        # identity and must not be copied into this field.
+        self.foundation_build_identity = foundation_build_identity
         self.host_profile = host_profile or HostProfile.detect()
         self.adapters: dict[str, EngineAdapter] = adapters or {
             "mock": MockAdapter(),
@@ -102,9 +114,18 @@ class RuntimeCore:
         return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_CONSUMER_ID
 
     @staticmethod
-    def _artifact(value: ModelArtifactBinding | dict[str, Any]) -> ModelArtifactBinding:
+    def _artifact(value: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any]) -> ModelArtifactBinding:
         if isinstance(value, ModelArtifactBinding):
             return value
+        if isinstance(value, ArtifactBindingV2):
+            return value.to_legacy()
+        if isinstance(value, dict) and (
+            value.get("contract_version") == CONTRACT_V2_VERSION
+            or "registry_identity" in value
+            or "content_identity" in value
+            or "locator" in value
+        ):
+            return ArtifactBindingV2.from_payload(value).to_legacy()
         return ModelArtifactBinding.from_payload(value)
 
     def _select_adapter(self, artifact: ModelArtifactBinding, requested: str | None) -> EngineAdapter:
@@ -113,7 +134,9 @@ class RuntimeCore:
             try:
                 selected = self.adapters[engine_name]
             except KeyError as exc:
-                raise EngineNotFoundError("requested engine is not registered", details={"engine": engine_name}) from exc
+                raise EngineNotFoundError(
+                    "requested engine is not registered", details={"engine": engine_name}
+                ) from exc
         else:
             engine_name = self._ARTIFACT_ENGINE_MAP.get(artifact.format)
             if engine_name is None:
@@ -348,6 +371,8 @@ class RuntimeCore:
                 host_observation=self.host_profile.to_dict(),
                 started_at=utc_now(),
             )
+            trace_v2 = self._make_v2_trace(request, loaded, selected, execution_id, trace.started_at)
+            trace.trace_v2 = trace_v2
             cancel_event = threading.Event()
             timeout_event = threading.Event()
             active = _ActiveRequest(request, cancel_event, timeout_event, selected, trace)
@@ -372,7 +397,7 @@ class RuntimeCore:
         active.cancel_event.set()
         try:
             active.adapter.cancel(request_id)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - cancellation must not mask timeout recording
             # The adapter's cooperative cancellation hook must not prevent the
             # Core from recording the timeout.
             pass
@@ -390,11 +415,125 @@ class RuntimeCore:
         )
 
     @staticmethod
-    def _raise_if_timed_out(
-        request: GenerationRequest, timeout_event: threading.Event, trace: ExecutionTrace
-    ) -> None:
+    def _raise_if_timed_out(request: GenerationRequest, timeout_event: threading.Event, trace: ExecutionTrace) -> None:
         if timeout_event.is_set():
             raise RuntimeCore._timeout_error(request, trace)
+
+    def _make_v2_trace(
+        self,
+        request: GenerationRequest,
+        artifact: ModelArtifactBinding,
+        selected: EngineAdapter,
+        execution_id: str,
+        started_at: str,
+    ) -> ExecutionTraceV2:
+        is_v2 = isinstance(request, GenerationRequestV2)
+        v2_request = cast(GenerationRequestV2, request) if is_v2 else None
+        thinking = (
+            v2_request.thinking_intent
+            if v2_request is not None
+            else ThinkingIntent.from_legacy(request.thinking_enabled)
+        )
+        studio_resolved = v2_request.studio_resolved_thinking if v2_request is not None else None
+        resolution = ThinkingResolution(
+            requested=thinking,
+            studio_resolved=studio_resolved,
+            foundation_effective=None,
+            status="requested" if is_v2 else "legacy_compatibility",
+            reason=None if is_v2 else "v1 thinking_enabled mapped for v2 evidence",
+        )
+        binding = build_execution_binding(
+            artifact=artifact,
+            engine=selected.identity(),
+            adapter_id=selected.name,
+            foundation_version=self.foundation_version,
+            foundation_build_identity=self.foundation_build_identity,
+            effective_runtime_options=None,
+        )
+        return ExecutionTraceV2(
+            execution_id=execution_id,
+            request_id=request.request_id,
+            request_contract_version=CONTRACT_V2_VERSION if is_v2 else CONTRACT_VERSION,
+            execution_binding=binding,
+            thinking_resolution=resolution,
+            started_at=started_at,
+            guard=v2_request.execution_guard if v2_request is not None else None,
+        )
+
+    @staticmethod
+    def _prepare_effective_request(
+        request: GenerationRequest,
+        selected: EngineAdapter,
+        resolution: RuntimeSettingsResolution,
+        trace_v2: ExecutionTraceV2,
+    ) -> GenerationRequest:
+        """Map v2 thinking to the adapter without silently downgrading it."""
+
+        if not isinstance(request, GenerationRequestV2):
+            intent = ThinkingIntent.from_legacy(request.thinking_enabled)
+            trace_v2.thinking_resolution = ThinkingResolution(
+                requested=intent,
+                studio_resolved=None,
+                foundation_effective=intent,
+                status="legacy_compatibility",
+                reason="v1 thinking_enabled was preserved and mapped to v2 evidence",
+            )
+            return replace(request, runtime_options=resolution.effective)
+
+        resolved = request.studio_resolved_thinking or request.thinking_intent
+        generation_options = selected.discover_capability().generation_options
+        capability = generation_options.get("thinking_enabled", {})
+        supports_thinking = capability.get("status") == "supported"
+        effort_capability = generation_options.get("thinking_effort", {})
+        budget_capability = generation_options.get("thinking_budget_tokens", {})
+        effort_supported = effort_capability.get("status") == "supported"
+        budget_supported = budget_capability.get("status") == "supported"
+        if (
+            (resolved.effort is not None and not effort_supported)
+            or (resolved.budget_tokens is not None and not budget_supported)
+            or not supports_thinking
+        ):
+            error = UnsupportedGenerationSettingError(
+                "the selected adapter cannot represent the requested thinking intent",
+                details={
+                    "field": "thinking_intent",
+                    "requested": request.thinking_intent.to_dict(),
+                    "studio_resolved": request.studio_resolved_thinking.to_dict()
+                    if request.studio_resolved_thinking
+                    else None,
+                    "adapter": selected.name,
+                    "resolution": "explicit_failure_required",
+                    "capability": {
+                        "thinking_enabled": capability,
+                        "thinking_effort": effort_capability,
+                        "thinking_budget_tokens": budget_capability,
+                    },
+                },
+            )
+            trace_v2.thinking_resolution = ThinkingResolution(
+                requested=request.thinking_intent,
+                studio_resolved=request.studio_resolved_thinking,
+                foundation_effective=None,
+                status="unsupported",
+                reason="adapter capability does not expose the requested effort/budget mechanism",
+                error=error.as_dict(),
+            )
+            raise error
+        trace_v2.thinking_resolution = ThinkingResolution(
+            requested=request.thinking_intent,
+            studio_resolved=request.studio_resolved_thinking,
+            foundation_effective=resolved,
+            status="resolved",
+            reason="Foundation mapped the Studio-resolved intent to the adapter boundary",
+        )
+        return cast(
+            GenerationRequest,
+            replace(
+                cast(Any, request),
+                runtime_options=resolution.effective,
+                thinking_enabled=resolved.to_legacy_enabled(),
+            ),
+        )
 
     def _end(self, request_id: str) -> None:
         with self._lock:
@@ -422,7 +561,9 @@ class RuntimeCore:
             self._raise_if_timed_out(request, timeout_event, trace)
             trace.runtime_settings_resolution = resolution
             trace.effective_runtime_settings = resolution.effective.to_dict()
-            effective_request = replace(request, runtime_options=resolution.effective)
+            trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
+            trace_v2.with_runtime_settings(resolution.effective)
+            effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
             result = selected.generate(effective_request, cancel_event)
             self._raise_if_timed_out(request, timeout_event, trace)
             if result.metrics.load_duration_ms is None:
@@ -437,7 +578,12 @@ class RuntimeCore:
             trace.metrics = result.metrics.to_dict()
             trace.finish_reason = result.finish_reason
             trace.finished_at = utc_now()
+            trace_v2.status = "completed"
+            trace_v2.metrics = result.metrics.to_dict()
+            trace_v2.finish_reason = result.finish_reason
+            trace_v2.finished_at = trace.finished_at
             result.trace = trace
+            result.generation_v2 = GenerationResultV2.from_result(result, trace_v2)
             self._last_error = None
             return result
         except RuntimeFoundationError as exc:
@@ -449,15 +595,27 @@ class RuntimeCore:
             exc.details.setdefault("execution_id", trace.execution_id)
             trace.error = error_payload(exc, execution_id=trace.execution_id)
             trace.finished_at = utc_now()
+            trace_v2_error = trace.trace_v2
+            if trace_v2_error is not None:
+                trace_v2_error.status = trace.status
+                trace_v2_error.finished_at = trace.finished_at
+                trace_v2_error.raw_execution_error = trace.error
             self._last_error = trace.error
             if timeout_cause is not None:
                 raise exc from timeout_cause
             raise
         except Exception as exc:
-            wrapped = EngineRuntimeError("engine generation failed", details={"engine": selected.name, "execution_id": trace.execution_id})
+            wrapped = EngineRuntimeError(
+                "engine generation failed", details={"engine": selected.name, "execution_id": trace.execution_id}
+            )
             trace.status = "error"
             trace.error = wrapped.as_dict()
             trace.finished_at = utc_now()
+            trace_v2_error = trace.trace_v2
+            if trace_v2_error is not None:
+                trace_v2_error.status = trace.status
+                trace_v2_error.finished_at = trace.finished_at
+                trace_v2_error.raw_execution_error = trace.error
             self._last_error = trace.error
             raise wrapped from exc
         finally:
@@ -477,7 +635,9 @@ class RuntimeCore:
                 self._raise_if_timed_out(request, timeout_event, trace)
                 trace.runtime_settings_resolution = resolution
                 trace.effective_runtime_settings = resolution.effective.to_dict()
-                effective_request = replace(request, runtime_options=resolution.effective)
+                trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
+                trace_v2.with_runtime_settings(resolution.effective)
+                effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
                 for event in selected.stream(effective_request, cancel_event):
                     if event.type == "started":
                         continue
@@ -493,6 +653,17 @@ class RuntimeCore:
                         result_payload["requested_runtime_settings"] = resolution.requested.to_dict()
                         result_payload["effective_runtime_settings"] = resolution.effective.to_dict()
                         result_payload["runtime_settings_resolution"] = resolution.to_dict()
+                        trace_v2.status = "completed"
+                        trace_v2.metrics = metrics_payload
+                        trace_v2.finish_reason = result_payload.get("finish_reason")
+                        trace_v2.finished_at = utc_now()
+                        result_payload["generation_v2"] = {
+                            "contract_version": CONTRACT_V2_VERSION,
+                            "schema_version": "runtime-foundation.generation-result.v2",
+                            "execution_binding": trace_v2.execution_binding.to_dict(),
+                            "execution_binding_fingerprint": trace_v2.execution_binding_fingerprint,
+                            "trace": trace_v2.to_dict(),
+                        }
                         trace.status = "completed"
                         trace.metrics = metrics_payload
                         trace.finish_reason = result_payload.get("finish_reason")
@@ -510,6 +681,11 @@ class RuntimeCore:
                         trace.status = "cancelled" if error.get("code") == "cancelled" else "error"
                         trace.error = error
                         trace.finished_at = utc_now()
+                        trace_v2_error = trace.trace_v2
+                        if trace_v2_error is not None:
+                            trace_v2_error.status = trace.status
+                            trace_v2_error.finished_at = trace.finished_at
+                            trace_v2_error.raw_execution_error = error
                         self._last_error = error
                     event.sequence = sequence
                     yield event
@@ -521,6 +697,11 @@ class RuntimeCore:
                 trace.status = "cancelled" if exc.code == "cancelled" else "error"
                 trace.error = error_payload(exc, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
+                trace_v2_error = trace.trace_v2
+                if trace_v2_error is not None:
+                    trace_v2_error.status = trace.status
+                    trace_v2_error.finished_at = trace.finished_at
+                    trace_v2_error.raw_execution_error = trace.error
                 self._last_error = trace.error
                 sequence += 1
                 yield StreamEvent(
@@ -530,11 +711,16 @@ class RuntimeCore:
                     done=True,
                     error=trace.error,
                 )
-            except Exception as exc:
+            except Exception:  # noqa: BLE001 - convert arbitrary adapter failures to stable runtime errors
                 wrapped = EngineRuntimeError("engine streaming failed", details={"engine": selected.name})
                 trace.status = "error"
                 trace.error = error_payload(wrapped, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
+                trace_v2_error = trace.trace_v2
+                if trace_v2_error is not None:
+                    trace_v2_error.status = trace.status
+                    trace_v2_error.finished_at = trace.finished_at
+                    trace_v2_error.raw_execution_error = trace.error
                 self._last_error = trace.error
                 sequence += 1
                 yield StreamEvent(
@@ -546,8 +732,15 @@ class RuntimeCore:
                 )
             finally:
                 if not completed and trace.status == "running":
-                    trace.status = "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
+                    trace.status = (
+                        "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
+                    )
                     trace.finished_at = utc_now()
+                    trace_v2_error = trace.trace_v2
+                    if trace_v2_error is not None:
+                        trace_v2_error.status = trace.status
+                        trace_v2_error.finished_at = trace.finished_at
+                        trace_v2_error.raw_execution_error = trace.error
                 self._finish_trace(trace)
                 self._end(request.request_id)
 
@@ -598,6 +791,7 @@ class RuntimeCore:
             active_request_ids=active,
             host=self.host_profile.to_dict(),
             last_error=last_error,
+            supported_contract_versions=list(SUPPORTED_CONTRACT_VERSIONS),
         ).to_dict()
 
     def runtime_metrics(self) -> dict[str, Any]:
@@ -609,6 +803,7 @@ class RuntimeCore:
         return {
             "contract_version": CONTRACT_VERSION,
             "foundation_version": self.foundation_version,
+            "supported_contract_versions": list(SUPPORTED_CONTRACT_VERSIONS),
             "captured_at": utc_now(),
             "lifecycle_state": state.value,
             "loaded_artifact_id": loaded.artifact_id if loaded else None,
