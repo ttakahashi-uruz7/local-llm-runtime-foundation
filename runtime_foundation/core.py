@@ -33,6 +33,7 @@ from .contracts_v2 import (
     GenerationRequestV2,
     GenerationResultV2,
     ThinkingIntent,
+    ThinkingMode,
     ThinkingResolution,
     build_execution_binding,
 )
@@ -46,7 +47,9 @@ from .errors import (
     RuntimeBusyError,
     RuntimeFoundationError,
     RuntimeTimeoutError,
+    ThinkingResolutionError,
     UnloadConflictError,
+    UnsupportedArtifactLocatorError,
     UnsupportedGenerationSettingError,
     error_payload,
 )
@@ -96,6 +99,7 @@ class RuntimeCore:
         self._lock = threading.RLock()
         self._state = LifecycleState.UNLOADED
         self._loaded_artifact: ModelArtifactBinding | None = None
+        self._loaded_artifact_v2: ArtifactBindingV2 | None = None
         self._loaded_adapter: EngineAdapter | None = None
         self._leases: dict[str, str] = {}
         self._active: dict[str, _ActiveRequest] = {}
@@ -114,19 +118,28 @@ class RuntimeCore:
         return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_CONSUMER_ID
 
     @staticmethod
-    def _artifact(value: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any]) -> ModelArtifactBinding:
+    def _artifact(
+        value: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
+    ) -> tuple[ArtifactBindingV2, ModelArtifactBinding]:
         if isinstance(value, ModelArtifactBinding):
-            return value
-        if isinstance(value, ArtifactBindingV2):
-            return value.to_legacy()
-        if isinstance(value, dict) and (
+            v2 = ArtifactBindingV2.from_legacy(value)
+        elif isinstance(value, ArtifactBindingV2):
+            v2 = value
+        elif isinstance(value, dict) and (
             value.get("contract_version") == CONTRACT_V2_VERSION
             or "registry_identity" in value
             or "content_identity" in value
             or "locator" in value
         ):
-            return ArtifactBindingV2.from_payload(value).to_legacy()
-        return ModelArtifactBinding.from_payload(value)
+            v2 = ArtifactBindingV2.from_payload(value)
+        else:
+            v2 = ArtifactBindingV2.from_legacy(ModelArtifactBinding.from_payload(value))
+        if v2.locator.type != "filesystem":
+            raise UnsupportedArtifactLocatorError(
+                "the current Foundation execution boundary supports filesystem locators only",
+                details={"locator_type": v2.locator.type, "artifact_id": v2.artifact_id},
+            )
+        return v2, v2.to_legacy()
 
     def _select_adapter(self, artifact: ModelArtifactBinding, requested: str | None) -> EngineAdapter:
         engine_name = requested.strip() if isinstance(requested, str) and requested.strip() else None
@@ -179,18 +192,19 @@ class RuntimeCore:
 
     def load(
         self,
-        artifact: ModelArtifactBinding | dict[str, Any],
+        artifact: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
         *,
         adapter: str | None = None,
         consumer_id: str | None = None,
     ) -> dict[str, Any]:
-        binding = self._artifact(artifact)
+        artifact_v2, binding = self._artifact(artifact)
         if not Path(binding.local_path).exists():
             raise ArtifactNotFoundError(
                 "model artifact path does not exist",
                 details={"artifact_id": binding.artifact_id, "local_path": binding.local_path},
             )
         owner = self._consumer_id(consumer_id)
+        selected: EngineAdapter
         try:
             selected = self._select_adapter(binding, adapter)
         except RuntimeFoundationError as exc:
@@ -198,16 +212,18 @@ class RuntimeCore:
                 self._state = LifecycleState.ERROR
                 self._last_error = exc.as_dict()
             raise
+        assert selected is not None
         with self._lock:
-            if self._loaded_artifact is not None:
+            loaded_adapter = self._loaded_adapter
+            if self._loaded_artifact is not None and loaded_adapter is not None:
                 if (
                     self._loaded_artifact.execution_identity() == binding.execution_identity()
-                    and self._loaded_adapter is selected
+                    and loaded_adapter is selected
                 ):
                     lease_id = self._leases.setdefault(owner, new_id("lease"))
                     result = LoadResult(
                         artifact=self._loaded_artifact,
-                        engine=selected.identity(),
+                        engine=loaded_adapter.identity(),
                         lifecycle_state=self._state,
                         lease_id=lease_id,
                         consumer_id=owner,
@@ -244,6 +260,7 @@ class RuntimeCore:
                 raise wrapped from exc
             self._last_load_duration_ms = (time.perf_counter() - started) * 1000
             self._loaded_artifact = binding
+            self._loaded_artifact_v2 = artifact_v2
             self._loaded_adapter = selected
             self._leases[owner] = new_id("lease")
             self._state = LifecycleState.LOADED
@@ -321,6 +338,7 @@ class RuntimeCore:
             self._last_unload_duration_ms = (time.perf_counter() - started) * 1000
             del self._leases[owner]
             self._loaded_artifact = None
+            self._loaded_artifact_v2 = None
             self._loaded_adapter = None
             self._state = LifecycleState.UNLOADED
             return UnloadResult(
@@ -371,7 +389,8 @@ class RuntimeCore:
                 host_observation=self.host_profile.to_dict(),
                 started_at=utc_now(),
             )
-            trace_v2 = self._make_v2_trace(request, loaded, selected, execution_id, trace.started_at)
+            loaded_v2 = self._loaded_artifact_v2 or ArtifactBindingV2.from_legacy(loaded)
+            trace_v2 = self._make_v2_trace(request, loaded_v2, selected, execution_id, trace.started_at)
             trace.trace_v2 = trace_v2
             cancel_event = threading.Event()
             timeout_event = threading.Event()
@@ -422,7 +441,7 @@ class RuntimeCore:
     def _make_v2_trace(
         self,
         request: GenerationRequest,
-        artifact: ModelArtifactBinding,
+        artifact: ArtifactBindingV2,
         selected: EngineAdapter,
         execution_id: str,
         started_at: str,
@@ -480,7 +499,32 @@ class RuntimeCore:
             )
             return replace(request, runtime_options=resolution.effective)
 
-        resolved = request.studio_resolved_thinking or request.thinking_intent
+        if request.thinking_intent.mode == ThinkingMode.AUTO:
+            studio_resolved = request.studio_resolved_thinking
+            if studio_resolved is None or studio_resolved.mode not in {ThinkingMode.OFF, ThinkingMode.ON}:
+                resolution_error = ThinkingResolutionError(
+                    "AUTO thinking requests require an explicit Studio ON/OFF resolution",
+                    details={
+                        "field": "studio_resolved_thinking",
+                        "requested": request.thinking_intent.to_dict(),
+                        "studio_resolved": studio_resolved.to_dict() if studio_resolved else None,
+                        "resolution": "studio_authority_required",
+                    },
+                )
+                trace_v2.thinking_resolution = ThinkingResolution(
+                    requested=request.thinking_intent,
+                    studio_resolved=studio_resolved,
+                    foundation_effective=None,
+                    status="unresolved",
+                    reason="Foundation does not resolve AUTO; Studio must provide ON or OFF",
+                    error=resolution_error.as_dict(),
+                )
+                raise resolution_error
+            resolved = studio_resolved
+        else:
+            # ON/OFF are already resolved by the caller; Studio resolution is
+            # not required and Foundation does not reinterpret the request.
+            resolved = request.thinking_intent
         generation_options = selected.discover_capability().generation_options
         capability = generation_options.get("thinking_enabled", {})
         supports_thinking = capability.get("status") == "supported"
@@ -493,7 +537,7 @@ class RuntimeCore:
             or (resolved.budget_tokens is not None and not budget_supported)
             or not supports_thinking
         ):
-            error = UnsupportedGenerationSettingError(
+            unsupported_error = UnsupportedGenerationSettingError(
                 "the selected adapter cannot represent the requested thinking intent",
                 details={
                     "field": "thinking_intent",
@@ -516,9 +560,9 @@ class RuntimeCore:
                 foundation_effective=None,
                 status="unsupported",
                 reason="adapter capability does not expose the requested effort/budget mechanism",
-                error=error.as_dict(),
+                error=unsupported_error.as_dict(),
             )
-            raise error
+            raise unsupported_error
         trace_v2.thinking_resolution = ThinkingResolution(
             requested=request.thinking_intent,
             studio_resolved=request.studio_resolved_thinking,

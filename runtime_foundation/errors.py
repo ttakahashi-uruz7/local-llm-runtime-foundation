@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+
 class RuntimeFoundationError(Exception):
     """Base exception with a version-independent machine-readable payload."""
 
@@ -41,6 +42,11 @@ class InvalidRequestError(RuntimeFoundationError):
 class ArtifactNotFoundError(RuntimeFoundationError):
     code = "artifact_not_found"
     http_status = 404
+
+
+class UnsupportedArtifactLocatorError(RuntimeFoundationError):
+    code = "unsupported_artifact_locator"
+    http_status = 400
 
 
 class ModelNotLoadedError(RuntimeFoundationError):
@@ -114,6 +120,11 @@ class RuntimeOptionUnavailableError(RuntimeFoundationError):
 
 class UnsupportedGenerationSettingError(RuntimeFoundationError):
     code = "unsupported_generation_setting"
+    http_status = 400
+
+
+class ThinkingResolutionError(RuntimeFoundationError):
+    code = "thinking_resolution_error"
     http_status = 400
 
 

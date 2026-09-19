@@ -17,7 +17,7 @@ from .network import validate_loopback_host
 from .version import FOUNDATION_VERSION
 
 
-def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding:
+def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding | ArtifactBindingV2:
     candidate = body.get("artifact")
     if candidate is None:
         candidate = {
@@ -44,7 +44,7 @@ def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding:
             or "content_identity" in candidate
             or "locator" in candidate
         ):
-            return ArtifactBindingV2.from_payload(candidate).to_legacy()
+            return ArtifactBindingV2.from_payload(candidate)
         return ModelArtifactBinding.from_payload(candidate)
     except (RuntimeFoundationError, ValueError) as exc:
         if isinstance(exc, RuntimeFoundationError):

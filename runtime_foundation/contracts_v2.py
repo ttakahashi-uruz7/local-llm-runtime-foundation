@@ -26,6 +26,7 @@ from .contracts import (
     _mapping,
     _non_negative_int,
 )
+from .errors import UnsupportedArtifactLocatorError
 
 CONTRACT_V2_VERSION = "runtime-foundation.contract.v2"
 GENERATION_REQUEST_V2_VERSION = "runtime-foundation.generation-request.v2"
@@ -35,6 +36,11 @@ EXECUTION_GUARD_VERSION = "runtime-foundation.execution-guard.v1"
 EXECUTION_BINDING_VERSION = "runtime-foundation.execution-binding.v1"
 
 SUPPORTED_CONTRACT_VERSIONS = (CONTRACT_VERSION, CONTRACT_V2_VERSION)
+
+COMPLETE_FILE_HASH_SCHEME = "complete-file-v1"
+COMPLETE_DIRECTORY_HASH_SCHEME = "complete-directory-manifest-v1"
+FAST_FILE_HASH_SCHEME = "fast-file-v1"
+FAST_DIRECTORY_HASH_SCHEME = "fast-directory-manifest-v1"
 
 
 def canonical_json(value: Any) -> str:
@@ -67,30 +73,59 @@ def _optional_text(value: Any, field_name: str) -> str | None:
     return _required_text(value, field_name)
 
 
-def _sha256_file(path: Path) -> str:
+def _raw_sha256_file(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
-    if path.is_dir():
-        for child in sorted((item for item in path.rglob("*") if item.is_file()), key=lambda item: item.as_posix()):
-            relative = child.relative_to(path).as_posix().encode("utf-8")
-            digest.update(len(relative).to_bytes(8, "big"))
-            digest.update(relative)
-            with child.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-    else:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+    length = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            length += len(chunk)
+            digest.update(chunk)
+    return length, digest.hexdigest()
+
+
+def _directory_files(path: Path) -> list[tuple[bytes, Path]]:
+    entries = [(item.relative_to(path).as_posix().encode("utf-8"), item) for item in path.rglob("*") if item.is_file()]
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def _complete_file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update((COMPLETE_FILE_HASH_SCHEME + "\0").encode("ascii"))
+    length, _ = _raw_sha256_file(path)
+    digest.update(length.to_bytes(8, "big"))
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
-def _fast_file_digest(path: Path) -> str:
-    """Create a development/change-detection digest without claiming full content."""
+def _complete_directory_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update((COMPLETE_DIRECTORY_HASH_SCHEME + "\0").encode("ascii"))
+    entries = _directory_files(path)
+    digest.update(len(entries).to_bytes(8, "big"))
+    for relative, child in entries:
+        length, file_digest = _raw_sha256_file(child)
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(b"file\0")
+        digest.update(length.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(file_digest))
+    return digest.hexdigest()
 
+
+def _complete_file(path: Path) -> tuple[str, str]:
+    if path.is_dir():
+        return _complete_directory_digest(path), COMPLETE_DIRECTORY_HASH_SCHEME
+    return _complete_file_digest(path), COMPLETE_FILE_HASH_SCHEME
+
+
+def _fast_sample_digest(path: Path) -> str:
     stat = path.stat()
     digest = hashlib.sha256()
-    digest.update(str(stat.st_size).encode("ascii"))
-    digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    digest.update(stat.st_size.to_bytes(8, "big"))
+    digest.update(stat.st_mtime_ns.to_bytes(8, "big", signed=True))
     if path.is_file():
         with path.open("rb") as handle:
             first = handle.read(64 * 1024)
@@ -98,6 +133,24 @@ def _fast_file_digest(path: Path) -> str:
             if stat.st_size > len(first):
                 handle.seek(max(0, stat.st_size - 64 * 1024))
                 digest.update(handle.read(64 * 1024))
+    return digest.hexdigest()
+
+
+def _fast_file_digest(path: Path) -> str:
+    """Create a development/change-detection digest without claiming full content."""
+
+    digest = hashlib.sha256()
+    if path.is_dir():
+        digest.update((FAST_DIRECTORY_HASH_SCHEME + "\0").encode("ascii"))
+        entries = _directory_files(path)
+        digest.update(len(entries).to_bytes(8, "big"))
+        for relative, child in entries:
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            digest.update(bytes.fromhex(_fast_sample_digest(child)))
+        return digest.hexdigest()
+    digest.update((FAST_FILE_HASH_SCHEME + "\0").encode("ascii"))
+    digest.update(bytes.fromhex(_fast_sample_digest(path)))
     return digest.hexdigest()
 
 
@@ -115,14 +168,26 @@ class ContentIdentity:
     digest: str
     scope: str = "artifact"
     scheme: str = ContentIdentityScheme.COMPLETE.value
+    canonicalization_scheme: str | None = None
 
     def __post_init__(self) -> None:
         algorithm = _required_text(self.algorithm, "content_identity.algorithm").lower()
         digest = _required_text(self.digest, "content_identity.digest")
         scope = _required_text(self.scope, "content_identity.scope")
         scheme = _required_text(self.scheme, "content_identity.scheme").lower()
+        canonicalization = _optional_text(self.canonicalization_scheme, "content_identity.canonicalization_scheme")
         if ":" in digest and digest.lower().startswith(f"{algorithm}:"):
             digest = digest.split(":", 1)[1]
+        allowed_canonicalization: dict[str, set[str | None]] = {
+            ContentIdentityScheme.COMPLETE.value: {COMPLETE_FILE_HASH_SCHEME, COMPLETE_DIRECTORY_HASH_SCHEME},
+            ContentIdentityScheme.FAST.value: {FAST_FILE_HASH_SCHEME, FAST_DIRECTORY_HASH_SCHEME},
+            ContentIdentityScheme.LEGACY.value: {None},
+        }
+        allowed_values = allowed_canonicalization.get(scheme)
+        if allowed_values is None:
+            raise ValueError(f"unsupported content identity scheme: {scheme}")
+        if canonicalization not in allowed_values:
+            raise ValueError("content_identity.canonicalization_scheme is required and unsupported for this scheme")
         if algorithm == "sha256" and scheme == ContentIdentityScheme.COMPLETE.value:
             if re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
                 raise ValueError("complete sha256 content identity requires a 64-character hexadecimal digest")
@@ -131,11 +196,12 @@ class ContentIdentity:
         object.__setattr__(self, "digest", digest)
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "scheme", scheme)
+        object.__setattr__(self, "canonicalization_scheme", canonicalization)
 
     @classmethod
     def from_payload(cls, payload: Any) -> ContentIdentity:
         value = _mapping(payload, "content_identity")
-        allowed = {"algorithm", "digest", "scope", "scheme"}
+        allowed = {"algorithm", "digest", "scope", "scheme", "canonicalization_scheme"}
         unknown = sorted(set(value) - allowed)
         if unknown:
             raise ValueError(f"unsupported fields in content_identity: {', '.join(unknown)}")
@@ -144,6 +210,7 @@ class ContentIdentity:
             digest=_required_text(value.get("digest"), "content_identity.digest"),
             scope=_required_text(value.get("scope", "artifact"), "content_identity.scope"),
             scheme=_required_text(value.get("scheme", ContentIdentityScheme.COMPLETE.value), "content_identity.scheme"),
+            canonicalization_scheme=value.get("canonicalization_scheme"),
         )
 
     @classmethod
@@ -152,25 +219,29 @@ class ContentIdentity:
         algorithm, separator, digest = raw.partition(":")
         if not separator:
             algorithm, digest = "sha256", raw
-        scheme = (
-            ContentIdentityScheme.COMPLETE.value
-            if re.fullmatch(r"[0-9a-fA-F]{64}", digest)
-            else ContentIdentityScheme.LEGACY.value
-        )
-        return cls(algorithm=algorithm, digest=digest, scope="artifact", scheme=scheme)
+        return cls(algorithm=algorithm, digest=digest, scope="artifact", scheme=ContentIdentityScheme.LEGACY.value)
 
     @classmethod
     def from_file(cls, path: str | Path, *, scheme: str = "complete", scope: str = "artifact") -> ContentIdentity:
         target = Path(path)
         if not target.exists():
             raise FileNotFoundError(target)
-        if scheme == ContentIdentityScheme.COMPLETE.value:
-            digest = _sha256_file(target)
-        elif scheme == ContentIdentityScheme.FAST.value:
+        normalized_scheme = _required_text(scheme, "scheme").lower()
+        canonicalization: str
+        if normalized_scheme == ContentIdentityScheme.COMPLETE.value:
+            digest, canonicalization = _complete_file(target)
+        elif normalized_scheme == ContentIdentityScheme.FAST.value:
             digest = _fast_file_digest(target)
+            canonicalization = FAST_DIRECTORY_HASH_SCHEME if target.is_dir() else FAST_FILE_HASH_SCHEME
         else:
             raise ValueError("content identity scheme must be complete or fast")
-        return cls(algorithm="sha256", digest=digest, scope=scope, scheme=scheme)
+        return cls(
+            algorithm="sha256",
+            digest=digest,
+            scope=scope,
+            scheme=normalized_scheme,
+            canonicalization_scheme=canonicalization,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +249,7 @@ class ContentIdentity:
             "digest": self.digest,
             "scope": self.scope,
             "scheme": self.scheme,
+            "canonicalization_scheme": self.canonicalization_scheme,
         }
 
 
@@ -217,11 +289,15 @@ class ArtifactBindingV2:
     format: str | None = None
     quantization: str | None = None
     revision: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "artifact_id", _required_text(self.artifact_id, "artifact_id"))
         if self.format is not None:
             object.__setattr__(self, "format", _required_text(self.format, "format").lower())
+        if not isinstance(self.metadata, dict):
+            raise TypeError("artifact metadata must be an object")
+        object.__setattr__(self, "metadata", dict(self.metadata))
 
     @property
     def local_path(self) -> str | None:
@@ -240,6 +316,7 @@ class ArtifactBindingV2:
             "format",
             "quantization",
             "revision",
+            "metadata",
         }
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -267,6 +344,7 @@ class ArtifactBindingV2:
             format=value.get("format"),
             quantization=value.get("quantization"),
             revision=value.get("revision"),
+            metadata=value.get("metadata", {}),
         )
 
     @classmethod
@@ -279,20 +357,38 @@ class ArtifactBindingV2:
             format=artifact.format,
             quantization=artifact.quantization,
             revision=artifact.revision,
+            metadata=artifact.metadata,
         )
 
     def to_legacy(self) -> ModelArtifactBinding:
+        if self.locator.type != "filesystem":
+            raise UnsupportedArtifactLocatorError(
+                "the current Foundation execution boundary supports filesystem locators only",
+                details={"locator_type": self.locator.type, "artifact_id": self.artifact_id},
+            )
         artifact_hash = None
         if self.content_identity is not None:
             artifact_hash = f"{self.content_identity.algorithm}:{self.content_identity.digest}"
         return ModelArtifactBinding(
             artifact_id=self.artifact_id,
-            local_path=self.local_path or self.locator.value,
+            local_path=self.locator.value,
             format=self.format or "unknown",
             quantization=self.quantization,
             artifact_hash=artifact_hash,
             revision=self.revision,
+            metadata=dict(self.metadata),
         )
+
+    def canonical_payload(self) -> dict[str, Any]:
+        """Return the certified artifact identity without execution location."""
+
+        return {
+            "registry_identity": {"artifact_id": self.artifact_id},
+            "content_identity": self.content_identity.to_dict() if self.content_identity else None,
+            "format": self.format,
+            "quantization": self.quantization,
+            "revision": self.revision,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -304,6 +400,7 @@ class ArtifactBindingV2:
             "format": self.format,
             "quantization": self.quantization,
             "revision": self.revision,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -480,7 +577,9 @@ class ExecutionBindingV2:
         return {
             "contract_version": CONTRACT_V2_VERSION,
             "schema_version": EXECUTION_BINDING_VERSION,
-            "artifact_binding": self.artifact_binding.to_dict(),
+            # Locator is recorded in the trace/artifact binding, but it is
+            # deliberately excluded from certified execution identity.
+            "artifact_binding": self.artifact_binding.canonical_payload(),
             "engine_binding": self.engine_binding.to_dict(),
             "foundation_binding": self.foundation_binding.to_dict(),
             "runtime_settings_binding": self.runtime_settings_binding.to_dict()
@@ -511,7 +610,20 @@ class ExecutionBindingV2:
         return binding
 
     def to_dict(self) -> dict[str, Any]:
-        return {**self.canonical_payload(), "execution_binding_fingerprint": self.fingerprint}
+        payload = {
+            "contract_version": CONTRACT_V2_VERSION,
+            "schema_version": EXECUTION_BINDING_VERSION,
+            # The wire binding records the locator for provenance.  The
+            # fingerprint is still computed from canonical_payload(), which
+            # intentionally excludes it.
+            "artifact_binding": self.artifact_binding.to_dict(),
+            "engine_binding": self.engine_binding.to_dict(),
+            "foundation_binding": self.foundation_binding.to_dict(),
+            "runtime_settings_binding": self.runtime_settings_binding.to_dict()
+            if self.runtime_settings_binding
+            else None,
+        }
+        return {**payload, "execution_binding_fingerprint": self.fingerprint}
 
 
 class ThinkingMode(str, Enum):
@@ -843,7 +955,7 @@ class GenerationResultV2:
 
 def build_execution_binding(
     *,
-    artifact: ModelArtifactBinding,
+    artifact: ModelArtifactBinding | ArtifactBindingV2,
     engine: Any,
     adapter_id: str,
     foundation_version: str,
@@ -851,7 +963,9 @@ def build_execution_binding(
     effective_runtime_options: RuntimeOptions | None,
 ) -> ExecutionBindingV2:
     return ExecutionBindingV2(
-        artifact_binding=ArtifactBindingV2.from_legacy(artifact),
+        artifact_binding=artifact
+        if isinstance(artifact, ArtifactBindingV2)
+        else ArtifactBindingV2.from_legacy(artifact),
         engine_binding=EngineBindingV2.from_legacy(engine, adapter_id=adapter_id),
         foundation_binding=FoundationBindingV2(
             contract_version=CONTRACT_V2_VERSION,
