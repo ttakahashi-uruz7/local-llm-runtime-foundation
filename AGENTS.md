@@ -125,3 +125,26 @@ Before calling the Foundation MLX path production validated, run the current Mac
 - At the start of each task, verify the repository root, `origin`, current branch, and HEAD.
 - If the actual repository root does not match the canonical path, HARD STOP before making changes, Git operations, tests, builds, or launchers.
 - Do not change the canonical path without explicit user instruction.
+
+## GitHub MCP mandatory operation path
+
+GitHub固有の参照・操作では、GitHub MCPを正規かつ最優先の経路とする。
+
+- Pull Request、Issue、review、comment、check / CI status、GitHub上のbranch / commit / repository metadata、その他GitHub APIで扱う情報の参照・操作は、利用可能なGitHub MCPを最初に使用する。
+- GitHubのWeb UIをbrowser、Computer Use、browser automation、Playwright等で操作してはならない。
+- GitHub MCPで実行可能な操作を、Web UI操作で代替してはならない。
+- MCPよりWeb UIの方が簡単、MCP操作に失敗した、または権限不足の可能性がある、という理由だけでbrowserへfallbackしてはならない。
+- GitHub MCPが利用不能・未接続・必要操作を非対応・実際のauthentication / permission / scope拒否で継続不能な場合は、そのGitHub操作をHARD STOPとして報告する。browserへ自動fallbackしない。
+- browser経由のGitHub操作は、HARD STOP報告後にユーザーがその操作について明示的に許可した場合だけ例外的に可能とする。
+- GitHub MCPが利用可能か不明な場合は、browserを開く前に利用可能なtool / MCPを確認する。確認せずWeb UIへ進まない。
+- repository内の通常のlocal Git操作には、本ファイルで別途定義されたSourcetree Embedded Git規約を適用する。GitHub MCP優先規約を理由に、正規local GitをPATH/system Gitへ切り替えない。
+- branch作成、commit、通常push、PR作成・更新、PR comment、CI / check確認等について、既存規約上ユーザー確認不要である場合は、MCP利用を理由に追加確認を要求しない。
+- main / PR merge、auto-merge有効化、force-push、branch / PR削除・close、権限変更、その他既存規約で明示承認が必要な操作は、MCPを使用する場合でも同じ承認境界を維持する。
+
+GitHub操作経路の優先順位は次の通りとする。
+
+1. GitHub MCP。
+2. repository規約で許可されたSourcetree Embedded Gitによるlocal Git操作。
+3. ユーザーが明示的に指定したその他の非browser経路。
+4. GitHub Web UI / browser / Computer Useは原則禁止。上記の明示例外時のみ使用可能。
+
