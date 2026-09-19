@@ -25,6 +25,7 @@ the active pre-generation enforcement semantics.
 | `HostProfile` | Point-in-time host observation. |
 | `EngineIdentity` | Engine name, version, and build. |
 | `EngineCapability` | What an installed/available adapter can execute or resolve. |
+| `BuildIdentityV1` | Structured deterministic build provenance: kind, canonical component fingerprint, and components. |
 | `ModelArtifactBinding` | Consumer-supplied artifact id/path/format/hash/revision. |
 | `RuntimeOptions` | Requested engine-neutral context/KV/prefill/cache/acceleration settings. |
 | `RuntimeSettingsResolution` | Requested settings, effective settings, option status, warnings. |
@@ -34,7 +35,7 @@ the active pre-generation enforcement semantics.
 | `TokenUsage` | Prompt/completion/total token observations. |
 | `RuntimeMetrics` | Raw timing, memory, pressure, swap, failure, cancellation, and cleanup observations. |
 | `LoadResult` / `UnloadResult` | Lifecycle operation results and lease information. |
-| `HealthResult` | Foundation/service health and lifecycle, without eligibility. |
+| `HealthResult` | Foundation/service health and lifecycle, including Foundation and selected-engine build identity evidence, without eligibility. |
 | `RuntimeErrorRecord` | Stable machine-readable error shape. |
 | `ExecutionTrace` | Execution id, engine, binding, requested/effective options, raw runtime settings resolution, host, metrics, finish/error. |
 

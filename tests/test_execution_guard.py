@@ -7,6 +7,7 @@ import pytest
 from runtime_foundation import (
     ArtifactBindingV2,
     ArtifactLocator,
+    BuildIdentityV1,
     ContentIdentity,
     ExecutionGuardV1,
     GenerationRequestV2,
@@ -23,6 +24,11 @@ from runtime_foundation.errors import (
     ExecutionBindingUnresolvableError,
     ExecutionGuardMismatchError,
     InvalidRequestError,
+)
+
+TEST_FOUNDATION_BUILD_IDENTITY = BuildIdentityV1.from_components(
+    kind="test-foundation-build-v1",
+    components={"test": {"version": "1"}},
 )
 
 
@@ -57,7 +63,7 @@ def _loaded_core(
     artifact: ArtifactBindingV2 | ModelArtifactBinding,
     *,
     adapter: MockAdapter | None = None,
-    foundation_build_identity: str | None = "foundation-test-build",
+    foundation_build_identity: BuildIdentityV1 = TEST_FOUNDATION_BUILD_IDENTITY,
 ) -> tuple[RuntimeCore, MockAdapter]:
     selected = adapter or MockAdapter()
     core = RuntimeCore(

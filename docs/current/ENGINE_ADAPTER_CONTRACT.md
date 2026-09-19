@@ -21,7 +21,7 @@ The Core never calls an engine library directly. Engine-specific arguments are c
 
 ## MLX primary adapter
 
-The MLX adapter is lazy and import-safe on Windows. On Apple Silicon it observes `mlx`/`mlx-lm`, the default device, package versions, and the callable signatures needed for capability reporting. It passes consumer-provided chat messages through `tokenizer.apply_chat_template`, including an explicit `thinking_enabled` flag when requested. If the tokenizer cannot accept that flag, the adapter returns `unsupported_generation_setting`; it does not silently remove the request.
+The MLX adapter is lazy and import-safe on Windows. On Apple Silicon it observes `mlx`/`mlx-lm`, the default device, package versions, and the callable signatures needed for capability reporting. Its structured Build Identity includes both distribution versions; if either version is unavailable, the build identity remains unknown. It passes consumer-provided chat messages through `tokenizer.apply_chat_template`, including an explicit `thinking_enabled` flag when requested. If the tokenizer cannot accept that flag, the adapter returns `unsupported_generation_setting`; it does not silently remove the request.
 
 The reference mapping is:
 
@@ -36,7 +36,7 @@ The reference mapping is:
 | `temperature` / `top_p` | MLX sampler construction | `unsupported_generation_setting` |
 | `acceleration.backend=auto` | resolved to `metal` | explicit option error if not supported |
 
-The current upstream `mlx-lm` API exposes `load`, `stream_generate`, `GenerationResponse`, chat templates, and the KV/prefill arguments used above. The Foundation implementation still marks real execution as **Mac validation pending** because this Windows host cannot validate API behavior, Metal allocation, cache cleanup, or observed throughput.
+The current upstream `mlx-lm` API exposes `load`, `stream_generate`, `GenerationResponse`, chat templates, and the KV/prefill arguments used above. The Foundation implementation still marks real execution as **Mac validation pending** because this Windows host cannot validate API behavior, Metal allocation, cache cleanup, or observed throughput. Build Identity is compatibility provenance, not a performance or production-readiness result.
 
 The adapter loads only a consumer-supplied local path. Foundation v1 does not download a model or mutate a registry.
 

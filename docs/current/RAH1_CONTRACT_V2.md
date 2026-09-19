@@ -36,13 +36,16 @@ Engine Binding v2 separates:
 
 - engine family (`mlx`);
 - implementation (`mlx-lm`) and its version;
-- build identity, which remains `null` when it cannot be observed; and
+- structured `BuildIdentityV1` build identity, which remains `null` when it
+  cannot be observed; and
 - adapter identity.
 
 Foundation Binding includes contract version, Foundation package version,
-optional build identity, and adapter identity. MLX family and `mlx-lm`
-implementation are intentionally distinct. `mlx-lm` APIs do not leak through
-the Studio-facing boundary.
+optional structured build identity, and adapter identity. Build Identity is
+fingerprinted from canonical JSON components and is distinct from
+`implementation.version`; legacy v1 build strings are not promoted to a
+certified identity. MLX family and `mlx-lm` implementation are intentionally
+distinct. `mlx-lm` APIs do not leak through the Studio-facing boundary.
 
 ## Execution Binding and settings fingerprint
 

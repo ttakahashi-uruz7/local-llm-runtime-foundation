@@ -42,6 +42,35 @@ Expected values must use the canonical `sha256:<64 lowercase hex characters>`
 format. A malformed value is an `invalid_request` with an
 `INVALID_EXPECTATION` trace decision.
 
+## Build Identity v1
+
+Build Identity is a first-class structured value with `kind`, a
+`sha256:<64 lowercase hex characters>` `fingerprint`, and JSON object
+`components`. The fingerprint is calculated from the canonical JSON form of
+`components`; it is not a package version and it is never inferred from an
+unrelated legacy `build` string. A version change in an observed component
+must therefore produce a new build fingerprint.
+
+The current observations are:
+
+- MLX uses `kind=python-distribution-set-v1` with both `mlx-lm.version` and
+  `mlx.version`. A missing version leaves the MLX build identity unknown.
+- The default Foundation Core observes the `runtime_foundation/**/*.py`
+  source/package tree as `kind=foundation-python-package-tree-v1`. Components
+  contain canonical relative POSIX paths, file sizes, and SHA-256 file
+  digests, in deterministic order. Absolute paths, tests, docs, pycache, and
+  Git metadata are excluded from this package-tree scope.
+- Mock uses a static deterministic development identity.
+- llama.cpp remains unknown until a trustworthy build observation exists.
+
+Tests and controlled environments may provide an explicit structured override.
+Version strings and malformed identities are rejected; Foundation does not
+manufacture replacement or placeholder values. The Foundation build identity
+and engine build identity are separately exposed in health/capability evidence
+and both participate in the Execution Binding fingerprint. Build Identity is
+provenance/compatibility evidence only; it is not production performance or
+deployment eligibility evidence.
+
 ## Guard outcomes and safety
 
 Guard evidence distinguishes:

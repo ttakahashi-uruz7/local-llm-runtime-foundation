@@ -446,6 +446,7 @@ class EngineCapability:
     runtime_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     generation_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     reason: str | None = None
+    build_identity: Any | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -462,6 +463,11 @@ class EngineCapability:
             "runtime_options": {key: dict(value) for key, value in self.runtime_options.items()},
             "generation_options": {key: dict(value) for key, value in self.generation_options.items()},
             "reason": self.reason,
+            "build_identity": (
+                self.build_identity.to_dict()
+                if self.build_identity is not None and hasattr(self.build_identity, "to_dict")
+                else self.build_identity
+            ),
         }
 
 
@@ -868,12 +874,16 @@ class HealthResult:
     host: dict[str, Any]
     last_error: dict[str, Any] | None = None
     supported_contract_versions: list[str] = field(default_factory=list)
+    foundation_build_identity: dict[str, Any] | None = None
+    engine_build_identity: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         supported = list(self.supported_contract_versions)
         payload = {
             "contract_version": self.contract_version,
             "foundation_version": self.foundation_version,
+            "foundation_build_identity": self.foundation_build_identity,
+            "engine_build_identity": self.engine_build_identity,
             "status": self.status,
             "lifecycle_state": self.lifecycle_state.value,
             "loaded_artifact_id": self.loaded_artifact_id,
@@ -900,6 +910,7 @@ def __getattr__(name: str) -> Any:
         "CONTRACT_V2_VERSION",
         "EngineBindingV2",
         "EngineImplementationBinding",
+        "BuildIdentityV1",
         "ExecutionBindingV2",
         "ExecutionGuard",
         "ExecutionGuardV1",

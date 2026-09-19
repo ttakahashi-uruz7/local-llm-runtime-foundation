@@ -42,6 +42,7 @@ from ..errors import (
     UnsupportedGenerationSettingError,
     UnsupportedRuntimeOptionError,
 )
+from ..contracts_v2 import BuildIdentityV1
 from ..host import runtime_snapshot
 from .base import EngineAdapter
 
@@ -110,6 +111,26 @@ class MLXAdapter(EngineAdapter):
             build=self._version("mlx") or getattr(mlx, "__version__", None),
         )
 
+    def build_identity(self) -> BuildIdentityV1 | None:
+        """Build identity from observed mlx-lm and mlx distribution versions."""
+
+        mlx, mlx_lm, _ = self._modules()
+        if mlx is None or mlx_lm is None:
+            return None
+        mlx_lm_version = self._version("mlx-lm") or getattr(mlx_lm, "__version__", None)
+        mlx_version = self._version("mlx") or getattr(mlx, "__version__", None)
+        if not isinstance(mlx_lm_version, str) or not mlx_lm_version.strip():
+            return None
+        if not isinstance(mlx_version, str) or not mlx_version.strip():
+            return None
+        return BuildIdentityV1.from_components(
+            kind="python-distribution-set-v1",
+            components={
+                "mlx-lm": {"version": mlx_lm_version.strip()},
+                "mlx": {"version": mlx_version.strip()},
+            },
+        )
+
     def discover_capability(self) -> EngineCapability:
         mlx, mlx_lm, reason = self._modules()
         if mlx is None or mlx_lm is None:
@@ -128,6 +149,7 @@ class MLXAdapter(EngineAdapter):
                     for name in ("max_tokens", "temperature", "top_p", "thinking_enabled")
                 },
                 reason=reason,
+                build_identity=self.build_identity(),
             )
         stream_generate = getattr(mlx_lm, "stream_generate")
         parameters = self._signature(stream_generate)
@@ -182,6 +204,7 @@ class MLXAdapter(EngineAdapter):
             runtime_options=runtime_options,
             generation_options=generation_options,
             reason="MLX/Metal capability observed at runtime; hardware validation remains pending",
+            build_identity=self.build_identity(),
         )
 
     def health(self) -> dict[str, Any]:

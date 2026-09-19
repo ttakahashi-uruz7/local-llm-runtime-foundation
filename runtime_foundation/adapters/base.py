@@ -23,6 +23,11 @@ class EngineAdapter(ABC):
 
     name: str
 
+    def build_identity(self) -> Any | None:
+        """Return structured observed build identity, or unknown."""
+
+        return None
+
     def identity(self) -> EngineIdentity:
         capability = self.discover_capability()
         return capability.identity

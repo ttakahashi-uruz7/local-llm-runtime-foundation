@@ -49,6 +49,7 @@ class LlamaCppAdapter(EngineAdapter):
                 for name in ("max_tokens", "temperature", "top_p", "thinking_enabled")
             },
             reason=reason,
+            build_identity=None,
         )
 
     def _unavailable(self) -> None:

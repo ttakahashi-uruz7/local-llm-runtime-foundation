@@ -26,6 +26,7 @@ from .contracts import (
     utc_now,
 )
 from .contracts_v2 import (
+    BuildIdentityV1,
     CONTRACT_V2_VERSION,
     SUPPORTED_CONTRACT_VERSIONS,
     ArtifactBindingV2,
@@ -39,6 +40,7 @@ from .contracts_v2 import (
     build_execution_binding,
     is_valid_fingerprint,
 )
+from .build_identity import observe_foundation_build_identity
 from .errors import (
     ArtifactNotFoundError,
     EngineNotFoundError,
@@ -62,6 +64,15 @@ from .host import HostProfile
 from .version import FOUNDATION_VERSION
 
 DEFAULT_CONSUMER_ID = "anonymous"
+
+
+def _build_identity_payload(identity: Any | None) -> dict[str, Any] | None:
+    if identity is None:
+        return None
+    if hasattr(identity, "to_dict"):
+        payload = identity.to_dict()
+        return payload if isinstance(payload, dict) else None
+    return dict(identity) if isinstance(identity, dict) else None
 
 
 @dataclass
@@ -89,12 +100,17 @@ class RuntimeCore:
         host_profile: HostProfile | None = None,
         adapters: dict[str, EngineAdapter] | None = None,
         foundation_version: str = FOUNDATION_VERSION,
-        foundation_build_identity: str | None = None,
+        foundation_build_identity: BuildIdentityV1 | dict[str, Any] | None = None,
     ) -> None:
         self.foundation_version = foundation_version
-        # Unknown build identities stay null; a package version is not a build
-        # identity and must not be copied into this field.
-        self.foundation_build_identity = foundation_build_identity
+        if foundation_build_identity is None:
+            self.foundation_build_identity = observe_foundation_build_identity()
+        elif isinstance(foundation_build_identity, BuildIdentityV1):
+            self.foundation_build_identity = foundation_build_identity
+        elif isinstance(foundation_build_identity, dict):
+            self.foundation_build_identity = BuildIdentityV1.from_payload(foundation_build_identity)
+        else:
+            raise ValueError("foundation_build_identity must be a validated BuildIdentityV1 or payload")
         self.host_profile = host_profile or HostProfile.detect()
         self.adapters: dict[str, EngineAdapter] = adapters or {
             "mock": MockAdapter(),
@@ -470,6 +486,7 @@ class RuntimeCore:
             artifact=artifact,
             engine=selected.identity(),
             adapter_id=selected.name,
+            engine_build_identity=selected.build_identity(),
             foundation_version=self.foundation_version,
             foundation_build_identity=self.foundation_build_identity,
             effective_runtime_options=None,
@@ -1004,6 +1021,7 @@ class RuntimeCore:
             status = "loaded"
         else:
             status = "ready"
+        engine_build_identity = _build_identity_payload(selected.build_identity() if selected is not None else None)
         return HealthResult(
             status=status,
             lifecycle_state=state,
@@ -1015,6 +1033,10 @@ class RuntimeCore:
             host=self.host_profile.to_dict(),
             last_error=last_error,
             supported_contract_versions=list(SUPPORTED_CONTRACT_VERSIONS),
+            foundation_build_identity=(
+                self.foundation_build_identity.to_dict() if self.foundation_build_identity is not None else None
+            ),
+            engine_build_identity=engine_build_identity,
         ).to_dict()
 
     def runtime_metrics(self) -> dict[str, Any]:
@@ -1023,9 +1045,14 @@ class RuntimeCore:
             selected = self._loaded_adapter
             active = list(self._active)
             state = self._state
+        engine_build_identity = _build_identity_payload(selected.build_identity() if selected is not None else None)
         return {
             "contract_version": CONTRACT_VERSION,
             "foundation_version": self.foundation_version,
+            "foundation_build_identity": (
+                self.foundation_build_identity.to_dict() if self.foundation_build_identity is not None else None
+            ),
+            "engine_build_identity": engine_build_identity,
             "supported_contract_versions": list(SUPPORTED_CONTRACT_VERSIONS),
             "captured_at": utc_now(),
             "lifecycle_state": state.value,

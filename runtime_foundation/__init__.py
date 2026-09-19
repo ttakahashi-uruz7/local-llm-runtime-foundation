@@ -29,12 +29,14 @@ from .contracts import (
     UnloadResult,
 )
 from .contracts_v2 import (
+    BUILD_IDENTITY_VERSION,
     CONTRACT_V2_VERSION,
     GENERATION_REQUEST_V2_VERSION,
     GENERATION_RESULT_V2_VERSION,
     SUPPORTED_CONTRACT_VERSIONS,
     ArtifactBindingV2,
     ArtifactLocator,
+    BuildIdentityV1,
     ContentIdentity,
     ContentIdentityScheme,
     EngineBindingV2,
@@ -61,6 +63,7 @@ from .host import HostProfile
 from .version import FOUNDATION_VERSION
 
 __all__ = [
+    "BUILD_IDENTITY_VERSION",
     "CONTRACT_V2_VERSION",
     "CONTRACT_VERSION",
     "FOUNDATION_VERSION",
@@ -73,6 +76,7 @@ __all__ = [
     "AccelerationSettings",
     "ArtifactBindingV2",
     "ArtifactLocator",
+    "BuildIdentityV1",
     "ContentIdentity",
     "ContentIdentityScheme",
     "ContextSettings",

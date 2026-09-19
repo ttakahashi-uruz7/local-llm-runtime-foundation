@@ -34,6 +34,7 @@ GENERATION_RESULT_V2_VERSION = "runtime-foundation.generation-result.v2"
 EXECUTION_TRACE_V2_VERSION = "runtime-foundation.execution-trace.v2"
 EXECUTION_GUARD_VERSION = "runtime-foundation.execution-guard.v1"
 EXECUTION_BINDING_VERSION = "runtime-foundation.execution-binding.v1"
+BUILD_IDENTITY_VERSION = "runtime-foundation.build-identity.v1"
 
 SUPPORTED_CONTRACT_VERSIONS = (CONTRACT_VERSION, CONTRACT_V2_VERSION)
 
@@ -424,40 +425,111 @@ class EngineImplementationBinding:
 
 
 @dataclass(frozen=True)
+class BuildIdentityV1:
+    """A deterministic identity for an observed runtime component set."""
+
+    kind: str
+    fingerprint: str
+    components: dict[str, Any]
+    schema_version: str = BUILD_IDENTITY_VERSION
+
+    def __post_init__(self) -> None:
+        kind = _required_text(self.kind, "build_identity.kind")
+        fingerprint = _required_text(self.fingerprint, "build_identity.fingerprint")
+        if not is_valid_fingerprint(fingerprint):
+            raise ValueError("build_identity.fingerprint must use sha256:<64 lowercase hex characters>")
+        if not isinstance(self.components, dict):
+            raise ValueError("build_identity.components must be an object")
+        schema_version = _required_text(self.schema_version, "build_identity.schema_version")
+        if schema_version != BUILD_IDENTITY_VERSION:
+            raise ValueError(f"build_identity.schema_version must be {BUILD_IDENTITY_VERSION}")
+        try:
+            normalized_components = json.loads(canonical_json(self.components))
+            expected = canonical_fingerprint(normalized_components)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("build_identity.components must be JSON-compatible") from exc
+        if fingerprint != expected:
+            raise ValueError("build_identity.fingerprint does not match canonical components")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "fingerprint", fingerprint)
+        object.__setattr__(self, "components", normalized_components)
+        object.__setattr__(self, "schema_version", schema_version)
+
+    @classmethod
+    def from_components(cls, *, kind: str, components: dict[str, Any]) -> BuildIdentityV1:
+        return cls(kind=kind, fingerprint=canonical_fingerprint(components), components=components)
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> BuildIdentityV1:
+        value = _mapping(payload, "build_identity")
+        allowed = {"schema_version", "kind", "fingerprint", "components"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported fields in build_identity: {', '.join(unknown)}")
+        kind = _required_text(value.get("kind"), "build_identity.kind")
+        fingerprint = _required_text(value.get("fingerprint"), "build_identity.fingerprint")
+        components = value.get("components")
+        if not isinstance(components, dict):
+            raise ValueError("build_identity.components must be an object")
+        return cls(
+            kind=kind,
+            fingerprint=fingerprint,
+            components=components,
+            schema_version=value.get("schema_version", BUILD_IDENTITY_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "fingerprint": self.fingerprint,
+            "components": dict(self.components),
+        }
+
+
+def _optional_build_identity(value: Any) -> BuildIdentityV1 | None:
+    """Read structured identity and downgrade old string wire values to unknown."""
+
+    if value is None:
+        return None
+    if isinstance(value, BuildIdentityV1):
+        return value
+    if isinstance(value, str):
+        # RAH-1's string field could contain a package version.  It is legacy
+        # evidence only and must never be promoted to a certified identity.
+        return None
+    return BuildIdentityV1.from_payload(value)
+
+
+@dataclass(frozen=True)
 class EngineBindingV2:
     family: str
     implementation: EngineImplementationBinding
-    build_identity: str | None
+    build_identity: BuildIdentityV1 | None
     adapter_id: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "family", _required_text(self.family, "engine.family").lower())
-        object.__setattr__(self, "build_identity", _optional_text(self.build_identity, "engine.build_identity"))
+        object.__setattr__(self, "build_identity", _optional_build_identity(self.build_identity))
         object.__setattr__(self, "adapter_id", _required_text(self.adapter_id, "engine.adapter_id"))
 
     @classmethod
-    def from_legacy(cls, identity: Any, *, adapter_id: str) -> EngineBindingV2:
+    def from_legacy(
+        cls,
+        identity: Any,
+        *,
+        adapter_id: str,
+        build_identity: BuildIdentityV1 | None = None,
+    ) -> EngineBindingV2:
         engine = _required_text(getattr(identity, "engine", None), "engine")
         if engine == "mlx":
             family, implementation_id = "mlx", "mlx-lm"
-            candidate = getattr(identity, "build", None)
-            # The current MLX v1 identity historically exposed the mlx
-            # package version in ``build``.  That is not an implementation
-            # build identity.  Preserve an explicitly build-shaped value,
-            # while leaving package-version-shaped/unknown values null.
-            build_identity = (
-                candidate
-                if isinstance(candidate, str)
-                and candidate.strip()
-                and re.fullmatch(r"v?\d+(?:\.\d+){1,3}(?:[-+].*)?", candidate.strip()) is None
-                else None
-            )
         elif engine == "mock":
-            family, implementation_id, build_identity = "mock", "mock-runtime", getattr(identity, "build", None)
+            family, implementation_id = "mock", "mock-runtime"
         elif engine in {"llama.cpp", "llama_cpp"}:
-            family, implementation_id, build_identity = "llama.cpp", "llama.cpp", None
+            family, implementation_id = "llama.cpp", "llama.cpp"
         else:
-            family, implementation_id, build_identity = engine, engine, getattr(identity, "build", None)
+            family, implementation_id = engine, engine
         return cls(
             family=family,
             implementation=EngineImplementationBinding(
@@ -475,7 +547,7 @@ class EngineBindingV2:
         return cls(
             family=_required_text(value.get("family"), "engine.family"),
             implementation=implementation,
-            build_identity=value.get("build_identity"),
+            build_identity=_optional_build_identity(value.get("build_identity")),
             adapter_id=_required_text(value.get("adapter_id"), "engine.adapter_id"),
         )
 
@@ -483,7 +555,7 @@ class EngineBindingV2:
         return {
             "family": self.family,
             "implementation": self.implementation.to_dict(),
-            "build_identity": self.build_identity,
+            "build_identity": self.build_identity.to_dict() if self.build_identity else None,
             "adapter_id": self.adapter_id,
         }
 
@@ -500,7 +572,7 @@ class EngineBindingV2:
 class FoundationBindingV2:
     contract_version: str
     foundation_version: str
-    build_identity: str | None
+    build_identity: BuildIdentityV1 | None
     adapter_id: str
 
     def __post_init__(self) -> None:
@@ -510,14 +582,14 @@ class FoundationBindingV2:
         object.__setattr__(
             self, "foundation_version", _required_text(self.foundation_version, "foundation.foundation_version")
         )
-        object.__setattr__(self, "build_identity", _optional_text(self.build_identity, "foundation.build_identity"))
+        object.__setattr__(self, "build_identity", _optional_build_identity(self.build_identity))
         object.__setattr__(self, "adapter_id", _required_text(self.adapter_id, "foundation.adapter_id"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "contract_version": self.contract_version,
             "foundation_version": self.foundation_version,
-            "build_identity": self.build_identity,
+            "build_identity": self.build_identity.to_dict() if self.build_identity else None,
             "adapter_id": self.adapter_id,
         }
 
@@ -994,15 +1066,20 @@ def build_execution_binding(
     artifact: ModelArtifactBinding | ArtifactBindingV2,
     engine: Any,
     adapter_id: str,
+    engine_build_identity: BuildIdentityV1 | None = None,
     foundation_version: str,
-    foundation_build_identity: str | None,
+    foundation_build_identity: BuildIdentityV1 | None,
     effective_runtime_options: RuntimeOptions | None,
 ) -> ExecutionBindingV2:
     return ExecutionBindingV2(
         artifact_binding=artifact
         if isinstance(artifact, ArtifactBindingV2)
         else ArtifactBindingV2.from_legacy(artifact),
-        engine_binding=EngineBindingV2.from_legacy(engine, adapter_id=adapter_id),
+        engine_binding=EngineBindingV2.from_legacy(
+            engine,
+            adapter_id=adapter_id,
+            build_identity=engine_build_identity,
+        ),
         foundation_binding=FoundationBindingV2(
             contract_version=CONTRACT_V2_VERSION,
             foundation_version=foundation_version,
@@ -1014,6 +1091,7 @@ def build_execution_binding(
 
 
 __all__ = [
+    "BUILD_IDENTITY_VERSION",
     "CONTRACT_V2_VERSION",
     "EXECUTION_BINDING_VERSION",
     "EXECUTION_GUARD_VERSION",
@@ -1023,6 +1101,7 @@ __all__ = [
     "SUPPORTED_CONTRACT_VERSIONS",
     "ArtifactBindingV2",
     "ArtifactLocator",
+    "BuildIdentityV1",
     "ContentIdentity",
     "ContentIdentityScheme",
     "EngineBindingV2",
