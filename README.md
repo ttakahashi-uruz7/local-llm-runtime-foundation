@@ -38,6 +38,8 @@ The Python client preserves Foundation remote errors without policy reinterpreta
 - Contract version: `runtime-foundation.contract.v1`
 - Supported contracts: `runtime-foundation.contract.v1`, `runtime-foundation.contract.v2`
 - Foundation version: `0.2.0`
+- Runtime package / contract baseline commit: `c00328e0356e706b0ab6504ef8fba2219a65778c`
+- Repository canonicalization merge: `753bbd935b444542a269bb93d8bb2e42172b5225` (repository operating documentation only; runtime baseline remains `c00328e...`)
 - Default local service: `http://127.0.0.1:8765`
 - Service bind is loopback-only (`127.0.0.1`, `::1`, or `localhost`); unauthenticated LAN/remote binding is rejected.
 - `GET /health`, `GET /host`, `GET /engines`
@@ -53,4 +55,4 @@ RAH-1 v2 details are in [RAH1_CONTRACT_V2.md](docs/current/RAH1_CONTRACT_V2.md).
 
 ## Repository history reference
 
-The initial extraction was designed from Benchmark Studio PR #10 (`bc81701aefaf04aba37d38d7272e255e10db8eed`) against the stated Benchmark main (`a18baef9e32644c813ea715855cfe103fd606f88`). PR #10 remains open and is not closed, merged, or repurposed by this repository.
+The initial extraction was designed from Benchmark Studio PR #10 (`bc81701aefaf04aba37d38d7272e255e10db8eed`) against the then-stated Benchmark main (`a18baef9e32644c813ea715855cfe103fd606f88`). Benchmark PR #10 was later merged into Benchmark main as `618dc037694665dd7ccbdbe995cc52c8e2515fb6` on 2026-09-14. These SHAs are historical extraction/integration anchors, not Current moving-main pointers; Benchmark main has advanced since that merge.
