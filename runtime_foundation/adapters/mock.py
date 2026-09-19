@@ -9,14 +9,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ..contracts import (
-    AccelerationSettings,
     EngineCapability,
     EngineIdentity,
     GenerationRequest,
     GenerationResult,
-    KVCacheSettings,
     ModelArtifactBinding,
-    PrefillSettings,
     RUNTIME_OPTION_PATHS,
     RuntimeMetrics,
     RuntimeOptions,
@@ -34,6 +31,7 @@ from ..errors import (
     RuntimeTimeoutError,
     UnsupportedRuntimeOptionError,
 )
+from ..contracts_v2 import BuildIdentityV1
 from .base import EngineAdapter
 
 
@@ -55,6 +53,12 @@ class MockAdapter(EngineAdapter):
 
     def identity(self) -> EngineIdentity:
         return EngineIdentity(engine=self.name, version="0.1-mock", build="foundation-mock")
+
+    def build_identity(self) -> BuildIdentityV1:
+        return BuildIdentityV1.from_components(
+            kind="mock-runtime-build-v1",
+            components={"mock-runtime": {"version": "0.1-mock", "profile": "deterministic-development"}},
+        )
 
     def discover_capability(self) -> EngineCapability:
         runtime_options = {
@@ -93,6 +97,7 @@ class MockAdapter(EngineAdapter):
             runtime_options=runtime_options,
             generation_options=generation_options,
             reason="deterministic development adapter",
+            build_identity=self.build_identity(),
         )
 
     def load(self, artifact: ModelArtifactBinding) -> dict[str, Any]:

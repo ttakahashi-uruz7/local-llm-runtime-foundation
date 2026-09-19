@@ -446,6 +446,7 @@ class EngineCapability:
     runtime_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     generation_options: dict[str, dict[str, Any]] = field(default_factory=dict)
     reason: str | None = None
+    build_identity: Any | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -462,6 +463,11 @@ class EngineCapability:
             "runtime_options": {key: dict(value) for key, value in self.runtime_options.items()},
             "generation_options": {key: dict(value) for key, value in self.generation_options.items()},
             "reason": self.reason,
+            "build_identity": (
+                self.build_identity.to_dict()
+                if self.build_identity is not None and hasattr(self.build_identity, "to_dict")
+                else self.build_identity
+            ),
         }
 
 
@@ -705,9 +711,11 @@ class ExecutionTrace:
     metrics: dict[str, Any] | None = None
     finish_reason: str | None = None
     error: dict[str, Any] | None = None
+    # Additive v2 companion.  It is omitted from v1 serialization when null.
+    trace_v2: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "contract_version": CONTRACT_VERSION,
             "execution_id": self.execution_id,
             "request_id": self.request_id,
@@ -726,6 +734,13 @@ class ExecutionTrace:
             "finish_reason": self.finish_reason,
             "error": self.error,
         }
+        # v2 evidence is attached only to newly created executions.  Keeping
+        # this optional preserves byte-for-byte v1 serialization for stored
+        # historical traces that do not carry a v2 companion.
+        trace_v2 = self.trace_v2
+        if trace_v2 is not None:
+            payload["trace_v2"] = trace_v2.to_dict() if hasattr(trace_v2, "to_dict") else trace_v2
+        return payload
 
 
 @dataclass
@@ -742,6 +757,8 @@ class GenerationResult:
     requested_runtime_settings: dict[str, Any] | None = None
     effective_runtime_settings: dict[str, Any] | None = None
     runtime_settings_resolution: RuntimeSettingsResolution | None = None
+    # Additive v2 result envelope.  It is omitted from v1 serialization when null.
+    generation_v2: Any = field(default=None, repr=False, compare=False)
 
     @property
     def adapter(self) -> str:
@@ -749,8 +766,8 @@ class GenerationResult:
 
         return self.engine
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_v2: bool = True) -> dict[str, Any]:
+        payload = {
             "contract_version": CONTRACT_VERSION,
             "schema_version": GENERATION_RESULT_VERSION,
             "request_id": self.request_id,
@@ -769,6 +786,10 @@ class GenerationResult:
                 self.runtime_settings_resolution.to_dict() if self.runtime_settings_resolution else None
             ),
         }
+        generation_v2 = self.generation_v2
+        if include_v2 and generation_v2 is not None:
+            payload["generation_v2"] = generation_v2.to_dict() if hasattr(generation_v2, "to_dict") else generation_v2
+        return payload
 
 
 @dataclass
@@ -852,11 +873,17 @@ class HealthResult:
     active_request_ids: list[str]
     host: dict[str, Any]
     last_error: dict[str, Any] | None = None
+    supported_contract_versions: list[str] = field(default_factory=list)
+    foundation_build_identity: dict[str, Any] | None = None
+    engine_build_identity: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        supported = list(self.supported_contract_versions)
+        payload = {
             "contract_version": self.contract_version,
             "foundation_version": self.foundation_version,
+            "foundation_build_identity": self.foundation_build_identity,
+            "engine_build_identity": self.engine_build_identity,
             "status": self.status,
             "lifecycle_state": self.lifecycle_state.value,
             "loaded_artifact_id": self.loaded_artifact_id,
@@ -864,4 +891,43 @@ class HealthResult:
             "active_request_ids": list(self.active_request_ids),
             "host": dict(self.host),
             "last_error": self.last_error,
+            "supported_contract_versions": supported,
+            # Keep a short discovery alias for consumers that call the field
+            # "supported_contracts" in their capability probes.
+            "supported_contracts": supported,
         }
+        return payload
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose additive v2 types without creating an import cycle."""
+
+    v2_names = {
+        "ArtifactBindingV2",
+        "ArtifactLocator",
+        "ContentIdentity",
+        "ContentIdentityScheme",
+        "CONTRACT_V2_VERSION",
+        "EngineBindingV2",
+        "EngineImplementationBinding",
+        "BuildIdentityV1",
+        "ExecutionBindingV2",
+        "ExecutionGuard",
+        "ExecutionGuardV1",
+        "ExecutionTraceV2",
+        "FoundationBindingV2",
+        "GenerationRequestV2",
+        "GenerationResultV2",
+        "RuntimeSettingsBindingV2",
+        "ThinkingEffort",
+        "ThinkingIntent",
+        "ThinkingMode",
+        "ThinkingResolution",
+        "canonical_fingerprint",
+        "canonical_json",
+    }
+    if name in v2_names:
+        from . import contracts_v2
+
+        return getattr(contracts_v2, name)
+    raise AttributeError(name)

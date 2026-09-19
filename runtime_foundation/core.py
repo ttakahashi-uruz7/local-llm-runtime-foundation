@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, ClassVar, cast
 
 from .adapters import EngineAdapter, LlamaCppAdapter, MLXAdapter, MockAdapter
 from .contracts import (
     CONTRACT_VERSION,
-    EngineCapability,
-    EngineIdentity,
     ExecutionTrace,
     GenerationRequest,
     GenerationResult,
@@ -20,32 +19,60 @@ from .contracts import (
     LifecycleState,
     LoadResult,
     ModelArtifactBinding,
-    RuntimeMetrics,
     RuntimeSettingsResolution,
     StreamEvent,
     UnloadResult,
     new_id,
     utc_now,
 )
+from .contracts_v2 import (
+    BuildIdentityV1,
+    CONTRACT_V2_VERSION,
+    SUPPORTED_CONTRACT_VERSIONS,
+    ArtifactBindingV2,
+    ExecutionGuardVerification,
+    ExecutionTraceV2,
+    GenerationRequestV2,
+    GenerationResultV2,
+    ThinkingIntent,
+    ThinkingMode,
+    ThinkingResolution,
+    build_execution_binding,
+    is_valid_fingerprint,
+)
+from .build_identity import observe_foundation_build_identity
 from .errors import (
     ArtifactNotFoundError,
     EngineNotFoundError,
     EngineRuntimeError,
     EngineUnavailableError,
+    ExecutionBindingUnresolvableError,
+    ExecutionGuardMismatchError,
+    InvalidRequestError,
     LoadConflictError,
     ModelNotLoadedError,
-    RequestCancelledError,
     RuntimeBusyError,
     RuntimeFoundationError,
     RuntimeTimeoutError,
+    ThinkingResolutionError,
     UnloadConflictError,
+    UnsupportedArtifactLocatorError,
+    UnsupportedGenerationSettingError,
     error_payload,
 )
 from .host import HostProfile
 from .version import FOUNDATION_VERSION
 
-
 DEFAULT_CONSUMER_ID = "anonymous"
+
+
+def _build_identity_payload(identity: Any | None) -> dict[str, Any] | None:
+    if identity is None:
+        return None
+    if hasattr(identity, "to_dict"):
+        payload = identity.to_dict()
+        return payload if isinstance(payload, dict) else None
+    return dict(identity) if isinstance(identity, dict) else None
 
 
 @dataclass
@@ -61,7 +88,7 @@ class _ActiveRequest:
 class RuntimeCore:
     """Own one loaded model process and expose engine-neutral operations."""
 
-    _ARTIFACT_ENGINE_MAP = {
+    _ARTIFACT_ENGINE_MAP: ClassVar[dict[str, str]] = {
         "mlx": "mlx",
         "safetensors": "mlx",
         "gguf": "llama.cpp",
@@ -73,8 +100,17 @@ class RuntimeCore:
         host_profile: HostProfile | None = None,
         adapters: dict[str, EngineAdapter] | None = None,
         foundation_version: str = FOUNDATION_VERSION,
+        foundation_build_identity: BuildIdentityV1 | dict[str, Any] | None = None,
     ) -> None:
         self.foundation_version = foundation_version
+        if foundation_build_identity is None:
+            self.foundation_build_identity = observe_foundation_build_identity()
+        elif isinstance(foundation_build_identity, BuildIdentityV1):
+            self.foundation_build_identity = foundation_build_identity
+        elif isinstance(foundation_build_identity, dict):
+            self.foundation_build_identity = BuildIdentityV1.from_payload(foundation_build_identity)
+        else:
+            raise ValueError("foundation_build_identity must be a validated BuildIdentityV1 or payload")
         self.host_profile = host_profile or HostProfile.detect()
         self.adapters: dict[str, EngineAdapter] = adapters or {
             "mock": MockAdapter(),
@@ -84,6 +120,7 @@ class RuntimeCore:
         self._lock = threading.RLock()
         self._state = LifecycleState.UNLOADED
         self._loaded_artifact: ModelArtifactBinding | None = None
+        self._loaded_artifact_v2: ArtifactBindingV2 | None = None
         self._loaded_adapter: EngineAdapter | None = None
         self._leases: dict[str, str] = {}
         self._active: dict[str, _ActiveRequest] = {}
@@ -102,10 +139,28 @@ class RuntimeCore:
         return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_CONSUMER_ID
 
     @staticmethod
-    def _artifact(value: ModelArtifactBinding | dict[str, Any]) -> ModelArtifactBinding:
+    def _artifact(
+        value: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
+    ) -> tuple[ArtifactBindingV2, ModelArtifactBinding]:
         if isinstance(value, ModelArtifactBinding):
-            return value
-        return ModelArtifactBinding.from_payload(value)
+            v2 = ArtifactBindingV2.from_legacy(value)
+        elif isinstance(value, ArtifactBindingV2):
+            v2 = value
+        elif isinstance(value, dict) and (
+            value.get("contract_version") == CONTRACT_V2_VERSION
+            or "registry_identity" in value
+            or "content_identity" in value
+            or "locator" in value
+        ):
+            v2 = ArtifactBindingV2.from_payload(value)
+        else:
+            v2 = ArtifactBindingV2.from_legacy(ModelArtifactBinding.from_payload(value))
+        if v2.locator.type != "filesystem":
+            raise UnsupportedArtifactLocatorError(
+                "the current Foundation execution boundary supports filesystem locators only",
+                details={"locator_type": v2.locator.type, "artifact_id": v2.artifact_id},
+            )
+        return v2, v2.to_legacy()
 
     def _select_adapter(self, artifact: ModelArtifactBinding, requested: str | None) -> EngineAdapter:
         engine_name = requested.strip() if isinstance(requested, str) and requested.strip() else None
@@ -113,7 +168,9 @@ class RuntimeCore:
             try:
                 selected = self.adapters[engine_name]
             except KeyError as exc:
-                raise EngineNotFoundError("requested engine is not registered", details={"engine": engine_name}) from exc
+                raise EngineNotFoundError(
+                    "requested engine is not registered", details={"engine": engine_name}
+                ) from exc
         else:
             engine_name = self._ARTIFACT_ENGINE_MAP.get(artifact.format)
             if engine_name is None:
@@ -156,18 +213,19 @@ class RuntimeCore:
 
     def load(
         self,
-        artifact: ModelArtifactBinding | dict[str, Any],
+        artifact: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
         *,
         adapter: str | None = None,
         consumer_id: str | None = None,
     ) -> dict[str, Any]:
-        binding = self._artifact(artifact)
+        artifact_v2, binding = self._artifact(artifact)
         if not Path(binding.local_path).exists():
             raise ArtifactNotFoundError(
                 "model artifact path does not exist",
                 details={"artifact_id": binding.artifact_id, "local_path": binding.local_path},
             )
         owner = self._consumer_id(consumer_id)
+        selected: EngineAdapter
         try:
             selected = self._select_adapter(binding, adapter)
         except RuntimeFoundationError as exc:
@@ -175,16 +233,18 @@ class RuntimeCore:
                 self._state = LifecycleState.ERROR
                 self._last_error = exc.as_dict()
             raise
+        assert selected is not None
         with self._lock:
-            if self._loaded_artifact is not None:
+            loaded_adapter = self._loaded_adapter
+            if self._loaded_artifact is not None and loaded_adapter is not None:
                 if (
                     self._loaded_artifact.execution_identity() == binding.execution_identity()
-                    and self._loaded_adapter is selected
+                    and loaded_adapter is selected
                 ):
                     lease_id = self._leases.setdefault(owner, new_id("lease"))
                     result = LoadResult(
                         artifact=self._loaded_artifact,
-                        engine=selected.identity(),
+                        engine=loaded_adapter.identity(),
                         lifecycle_state=self._state,
                         lease_id=lease_id,
                         consumer_id=owner,
@@ -221,6 +281,7 @@ class RuntimeCore:
                 raise wrapped from exc
             self._last_load_duration_ms = (time.perf_counter() - started) * 1000
             self._loaded_artifact = binding
+            self._loaded_artifact_v2 = artifact_v2
             self._loaded_adapter = selected
             self._leases[owner] = new_id("lease")
             self._state = LifecycleState.LOADED
@@ -298,6 +359,7 @@ class RuntimeCore:
             self._last_unload_duration_ms = (time.perf_counter() - started) * 1000
             del self._leases[owner]
             self._loaded_artifact = None
+            self._loaded_artifact_v2 = None
             self._loaded_adapter = None
             self._state = LifecycleState.UNLOADED
             return UnloadResult(
@@ -348,6 +410,9 @@ class RuntimeCore:
                 host_observation=self.host_profile.to_dict(),
                 started_at=utc_now(),
             )
+            loaded_v2 = self._loaded_artifact_v2 or ArtifactBindingV2.from_legacy(loaded)
+            trace_v2 = self._make_v2_trace(request, loaded_v2, selected, execution_id, trace.started_at)
+            trace.trace_v2 = trace_v2
             cancel_event = threading.Event()
             timeout_event = threading.Event()
             active = _ActiveRequest(request, cancel_event, timeout_event, selected, trace)
@@ -372,7 +437,7 @@ class RuntimeCore:
         active.cancel_event.set()
         try:
             active.adapter.cancel(request_id)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - cancellation must not mask timeout recording
             # The adapter's cooperative cancellation hook must not prevent the
             # Core from recording the timeout.
             pass
@@ -390,11 +455,327 @@ class RuntimeCore:
         )
 
     @staticmethod
-    def _raise_if_timed_out(
-        request: GenerationRequest, timeout_event: threading.Event, trace: ExecutionTrace
-    ) -> None:
+    def _raise_if_timed_out(request: GenerationRequest, timeout_event: threading.Event, trace: ExecutionTrace) -> None:
         if timeout_event.is_set():
             raise RuntimeCore._timeout_error(request, trace)
+
+    def _make_v2_trace(
+        self,
+        request: GenerationRequest,
+        artifact: ArtifactBindingV2,
+        selected: EngineAdapter,
+        execution_id: str,
+        started_at: str,
+    ) -> ExecutionTraceV2:
+        is_v2 = isinstance(request, GenerationRequestV2)
+        v2_request = cast(GenerationRequestV2, request) if is_v2 else None
+        thinking = (
+            v2_request.thinking_intent
+            if v2_request is not None
+            else ThinkingIntent.from_legacy(request.thinking_enabled)
+        )
+        studio_resolved = v2_request.studio_resolved_thinking if v2_request is not None else None
+        resolution = ThinkingResolution(
+            requested=thinking,
+            studio_resolved=studio_resolved,
+            foundation_effective=None,
+            status="requested" if is_v2 else "legacy_compatibility",
+            reason=None if is_v2 else "v1 thinking_enabled mapped for v2 evidence",
+        )
+        binding = build_execution_binding(
+            artifact=artifact,
+            engine=selected.identity(),
+            adapter_id=selected.name,
+            engine_build_identity=selected.build_identity(),
+            foundation_version=self.foundation_version,
+            foundation_build_identity=self.foundation_build_identity,
+            effective_runtime_options=None,
+        )
+        return ExecutionTraceV2(
+            execution_id=execution_id,
+            request_id=request.request_id,
+            request_contract_version=CONTRACT_V2_VERSION if is_v2 else CONTRACT_VERSION,
+            execution_binding=binding,
+            thinking_resolution=resolution,
+            started_at=started_at,
+            guard=v2_request.execution_guard if v2_request is not None else None,
+        )
+
+    @staticmethod
+    def _prepare_effective_request(
+        request: GenerationRequest,
+        selected: EngineAdapter,
+        resolution: RuntimeSettingsResolution,
+        trace_v2: ExecutionTraceV2,
+    ) -> GenerationRequest:
+        """Map v2 thinking to the adapter without silently downgrading it."""
+
+        if not isinstance(request, GenerationRequestV2):
+            intent = ThinkingIntent.from_legacy(request.thinking_enabled)
+            trace_v2.thinking_resolution = ThinkingResolution(
+                requested=intent,
+                studio_resolved=None,
+                foundation_effective=intent,
+                status="legacy_compatibility",
+                reason="v1 thinking_enabled was preserved and mapped to v2 evidence",
+            )
+            return replace(request, runtime_options=resolution.effective)
+
+        if request.thinking_intent.mode == ThinkingMode.AUTO:
+            studio_resolved = request.studio_resolved_thinking
+            if studio_resolved is None or studio_resolved.mode not in {ThinkingMode.OFF, ThinkingMode.ON}:
+                resolution_error = ThinkingResolutionError(
+                    "AUTO thinking requests require an explicit Studio ON/OFF resolution",
+                    details={
+                        "field": "studio_resolved_thinking",
+                        "requested": request.thinking_intent.to_dict(),
+                        "studio_resolved": studio_resolved.to_dict() if studio_resolved else None,
+                        "resolution": "studio_authority_required",
+                    },
+                )
+                trace_v2.thinking_resolution = ThinkingResolution(
+                    requested=request.thinking_intent,
+                    studio_resolved=studio_resolved,
+                    foundation_effective=None,
+                    status="unresolved",
+                    reason="Foundation does not resolve AUTO; Studio must provide ON or OFF",
+                    error=resolution_error.as_dict(),
+                )
+                raise resolution_error
+            resolved = studio_resolved
+        else:
+            # ON/OFF are already resolved by the caller; Studio resolution is
+            # not required and Foundation does not reinterpret the request.
+            resolved = request.thinking_intent
+        generation_options = selected.discover_capability().generation_options
+        capability = generation_options.get("thinking_enabled", {})
+        supports_thinking = capability.get("status") == "supported"
+        effort_capability = generation_options.get("thinking_effort", {})
+        budget_capability = generation_options.get("thinking_budget_tokens", {})
+        effort_supported = effort_capability.get("status") == "supported"
+        budget_supported = budget_capability.get("status") == "supported"
+        if (
+            (resolved.effort is not None and not effort_supported)
+            or (resolved.budget_tokens is not None and not budget_supported)
+            or not supports_thinking
+        ):
+            unsupported_error = UnsupportedGenerationSettingError(
+                "the selected adapter cannot represent the requested thinking intent",
+                details={
+                    "field": "thinking_intent",
+                    "requested": request.thinking_intent.to_dict(),
+                    "studio_resolved": request.studio_resolved_thinking.to_dict()
+                    if request.studio_resolved_thinking
+                    else None,
+                    "adapter": selected.name,
+                    "resolution": "explicit_failure_required",
+                    "capability": {
+                        "thinking_enabled": capability,
+                        "thinking_effort": effort_capability,
+                        "thinking_budget_tokens": budget_capability,
+                    },
+                },
+            )
+            trace_v2.thinking_resolution = ThinkingResolution(
+                requested=request.thinking_intent,
+                studio_resolved=request.studio_resolved_thinking,
+                foundation_effective=None,
+                status="unsupported",
+                reason="adapter capability does not expose the requested effort/budget mechanism",
+                error=unsupported_error.as_dict(),
+            )
+            raise unsupported_error
+        trace_v2.thinking_resolution = ThinkingResolution(
+            requested=request.thinking_intent,
+            studio_resolved=request.studio_resolved_thinking,
+            foundation_effective=resolved,
+            status="resolved",
+            reason="Foundation mapped the Studio-resolved intent to the adapter boundary",
+        )
+        return cast(
+            GenerationRequest,
+            replace(
+                cast(Any, request),
+                runtime_options=resolution.effective,
+                thinking_enabled=resolved.to_legacy_enabled(),
+            ),
+        )
+
+    @staticmethod
+    def _guard_details(
+        request: GenerationRequestV2,
+        trace_v2: ExecutionTraceV2,
+        *,
+        mismatch_category: str,
+    ) -> dict[str, Any]:
+        guard = trace_v2.guard
+        assert guard is not None
+        return {
+            "expected_execution_binding_fingerprint": guard.expected_execution_binding_fingerprint,
+            "actual_execution_binding_fingerprint": trace_v2.execution_binding_fingerprint,
+            "expected_runtime_settings_fingerprint": guard.expected_runtime_settings_fingerprint,
+            "actual_runtime_settings_fingerprint": (
+                trace_v2.runtime_settings_binding.exact_settings_fingerprint
+                if trace_v2.runtime_settings_binding
+                else None
+            ),
+            "mismatch_category": mismatch_category,
+            "request_id": request.request_id,
+            "execution_id": trace_v2.execution_id,
+            "generation_started": False,
+        }
+
+    def _verify_execution_guard(self, request: GenerationRequest, trace_v2: ExecutionTraceV2) -> None:
+        """Verify strict v2 expectations after effective settings are bound."""
+
+        if not isinstance(request, GenerationRequestV2) or request.execution_guard is None:
+            return
+
+        guard = request.execution_guard
+        trace_v2.guard = guard
+        expected_execution = guard.expected_execution_binding_fingerprint
+        expected_settings = guard.expected_runtime_settings_fingerprint
+        actual_execution = trace_v2.execution_binding_fingerprint
+        actual_settings = (
+            trace_v2.runtime_settings_binding.exact_settings_fingerprint if trace_v2.runtime_settings_binding else None
+        )
+        error: RuntimeFoundationError
+
+        if expected_execution is None and expected_settings is None:
+            category = "invalid_expectation"
+            details = self._guard_details(request, trace_v2, mismatch_category=category)
+            error = InvalidRequestError(
+                "execution_guard must specify at least one expected fingerprint",
+                details=details,
+            )
+            trace_v2.guard_verification = ExecutionGuardVerification(
+                status="INVALID_EXPECTATION",
+                mismatch_category=category,
+                expected_execution_binding_fingerprint=expected_execution,
+                actual_execution_binding_fingerprint=actual_execution,
+                expected_runtime_settings_fingerprint=expected_settings,
+                actual_runtime_settings_fingerprint=actual_settings,
+                error=error.as_dict(),
+            )
+            raise error
+
+        for field_name, value in (
+            ("expected_execution_binding_fingerprint", expected_execution),
+            ("expected_runtime_settings_fingerprint", expected_settings),
+        ):
+            if value is not None and not is_valid_fingerprint(value):
+                category = "invalid_expectation"
+                details = self._guard_details(request, trace_v2, mismatch_category=category)
+                details["field"] = field_name
+                error = InvalidRequestError(
+                    f"{field_name} must use sha256:<64 lowercase hex characters>",
+                    details=details,
+                )
+                trace_v2.guard_verification = ExecutionGuardVerification(
+                    status="INVALID_EXPECTATION",
+                    mismatch_category=category,
+                    expected_execution_binding_fingerprint=expected_execution,
+                    actual_execution_binding_fingerprint=actual_execution,
+                    expected_runtime_settings_fingerprint=expected_settings,
+                    actual_runtime_settings_fingerprint=actual_settings,
+                    error=error.as_dict(),
+                )
+                raise error
+
+        if expected_execution is not None:
+            binding = trace_v2.execution_binding
+            missing: list[str] = []
+            content = binding.artifact_binding.content_identity
+            if content is None or content.scheme != "complete":
+                missing.append("artifact_binding.content_identity.complete")
+            engine = binding.engine_binding
+            if not engine.family:
+                missing.append("engine_binding.family")
+            if not engine.implementation.id:
+                missing.append("engine_binding.implementation.id")
+            if not engine.implementation.version:
+                missing.append("engine_binding.implementation.version")
+            if not engine.build_identity:
+                missing.append("engine_binding.build_identity")
+            if not engine.adapter_id:
+                missing.append("engine_binding.adapter_id")
+            foundation = binding.foundation_binding
+            if not foundation.contract_version:
+                missing.append("foundation_binding.contract_version")
+            if not foundation.foundation_version:
+                missing.append("foundation_binding.foundation_version")
+            if not foundation.build_identity:
+                missing.append("foundation_binding.build_identity")
+            if not foundation.adapter_id:
+                missing.append("foundation_binding.adapter_id")
+            if actual_execution is None:
+                missing.append("execution_binding_fingerprint")
+            if missing:
+                category = "execution_binding_unresolvable"
+                details = self._guard_details(request, trace_v2, mismatch_category=category)
+                details["unresolvable_fields"] = missing
+                error = ExecutionBindingUnresolvableError(
+                    "actual execution binding cannot be safely certified",
+                    details=details,
+                )
+                trace_v2.guard_verification = ExecutionGuardVerification(
+                    status="UNRESOLVABLE",
+                    mismatch_category=category,
+                    expected_execution_binding_fingerprint=expected_execution,
+                    actual_execution_binding_fingerprint=actual_execution,
+                    expected_runtime_settings_fingerprint=expected_settings,
+                    actual_runtime_settings_fingerprint=actual_settings,
+                    error=error.as_dict(),
+                )
+                raise error
+
+        mismatch: str | None = None
+        if expected_execution is not None and expected_execution != actual_execution:
+            mismatch = "execution_binding_mismatch"
+        if expected_settings is not None and expected_settings != actual_settings:
+            mismatch = "runtime_settings_mismatch" if mismatch is None else "execution_guard_mismatch"
+        if mismatch is not None:
+            details = self._guard_details(request, trace_v2, mismatch_category=mismatch)
+            error = ExecutionGuardMismatchError(
+                "execution guard expectations do not match actual state", details=details
+            )
+            trace_v2.guard_verification = ExecutionGuardVerification(
+                status="MISMATCH",
+                mismatch_category=mismatch,
+                expected_execution_binding_fingerprint=expected_execution,
+                actual_execution_binding_fingerprint=actual_execution,
+                expected_runtime_settings_fingerprint=expected_settings,
+                actual_runtime_settings_fingerprint=actual_settings,
+                error=error.as_dict(),
+            )
+            raise error
+
+        trace_v2.guard_verification = ExecutionGuardVerification(
+            status="MATCH",
+            expected_execution_binding_fingerprint=expected_execution,
+            actual_execution_binding_fingerprint=actual_execution,
+            expected_runtime_settings_fingerprint=expected_settings,
+            actual_runtime_settings_fingerprint=actual_settings,
+            generation_started=False,
+        )
+
+    def _resolve_runtime_and_guard(
+        self,
+        request: GenerationRequest,
+        selected: EngineAdapter,
+        timeout_event: threading.Event,
+        trace: ExecutionTrace,
+    ) -> RuntimeSettingsResolution:
+        """Shared settings-resolution and pre-generation safety path."""
+
+        resolution = selected.resolve_runtime_options(request.runtime_options)
+        self._raise_if_timed_out(request, timeout_event, trace)
+        trace.runtime_settings_resolution = resolution
+        trace.effective_runtime_settings = resolution.effective.to_dict()
+        trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
+        trace_v2.with_runtime_settings(resolution.effective)
+        self._verify_execution_guard(request, trace_v2)
+        return resolution
 
     def _end(self, request_id: str) -> None:
         with self._lock:
@@ -418,11 +799,12 @@ class RuntimeCore:
     def generate(self, request: GenerationRequest) -> GenerationResult:
         _, selected, cancel_event, timeout_event, trace = self._begin(request)
         try:
-            resolution: RuntimeSettingsResolution = selected.resolve_runtime_options(request.runtime_options)
-            self._raise_if_timed_out(request, timeout_event, trace)
-            trace.runtime_settings_resolution = resolution
-            trace.effective_runtime_settings = resolution.effective.to_dict()
-            effective_request = replace(request, runtime_options=resolution.effective)
+            resolution = self._resolve_runtime_and_guard(request, selected, timeout_event, trace)
+            trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
+            effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
+            trace_v2.generation_started = True
+            if trace_v2.guard_verification is not None:
+                trace_v2.guard_verification = replace(trace_v2.guard_verification, generation_started=True)
             result = selected.generate(effective_request, cancel_event)
             self._raise_if_timed_out(request, timeout_event, trace)
             if result.metrics.load_duration_ms is None:
@@ -437,7 +819,12 @@ class RuntimeCore:
             trace.metrics = result.metrics.to_dict()
             trace.finish_reason = result.finish_reason
             trace.finished_at = utc_now()
+            trace_v2.status = "completed"
+            trace_v2.metrics = result.metrics.to_dict()
+            trace_v2.finish_reason = result.finish_reason
+            trace_v2.finished_at = trace.finished_at
             result.trace = trace
+            result.generation_v2 = GenerationResultV2.from_result(result, trace_v2)
             self._last_error = None
             return result
         except RuntimeFoundationError as exc:
@@ -449,15 +836,27 @@ class RuntimeCore:
             exc.details.setdefault("execution_id", trace.execution_id)
             trace.error = error_payload(exc, execution_id=trace.execution_id)
             trace.finished_at = utc_now()
+            trace_v2_error = trace.trace_v2
+            if trace_v2_error is not None:
+                trace_v2_error.status = trace.status
+                trace_v2_error.finished_at = trace.finished_at
+                trace_v2_error.raw_execution_error = trace.error
             self._last_error = trace.error
             if timeout_cause is not None:
                 raise exc from timeout_cause
             raise
         except Exception as exc:
-            wrapped = EngineRuntimeError("engine generation failed", details={"engine": selected.name, "execution_id": trace.execution_id})
+            wrapped = EngineRuntimeError(
+                "engine generation failed", details={"engine": selected.name, "execution_id": trace.execution_id}
+            )
             trace.status = "error"
             trace.error = wrapped.as_dict()
             trace.finished_at = utc_now()
+            trace_v2_error = trace.trace_v2
+            if trace_v2_error is not None:
+                trace_v2_error.status = trace.status
+                trace_v2_error.finished_at = trace.finished_at
+                trace_v2_error.raw_execution_error = trace.error
             self._last_error = trace.error
             raise wrapped from exc
         finally:
@@ -472,12 +871,13 @@ class RuntimeCore:
             completed = False
             terminal_error = False
             try:
+                resolution = self._resolve_runtime_and_guard(request, selected, timeout_event, trace)
+                trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
+                effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
                 yield StreamEvent(type="started", request_id=request.request_id, sequence=sequence)
-                resolution = selected.resolve_runtime_options(request.runtime_options)
-                self._raise_if_timed_out(request, timeout_event, trace)
-                trace.runtime_settings_resolution = resolution
-                trace.effective_runtime_settings = resolution.effective.to_dict()
-                effective_request = replace(request, runtime_options=resolution.effective)
+                trace_v2.generation_started = True
+                if trace_v2.guard_verification is not None:
+                    trace_v2.guard_verification = replace(trace_v2.guard_verification, generation_started=True)
                 for event in selected.stream(effective_request, cancel_event):
                     if event.type == "started":
                         continue
@@ -493,6 +893,17 @@ class RuntimeCore:
                         result_payload["requested_runtime_settings"] = resolution.requested.to_dict()
                         result_payload["effective_runtime_settings"] = resolution.effective.to_dict()
                         result_payload["runtime_settings_resolution"] = resolution.to_dict()
+                        trace_v2.status = "completed"
+                        trace_v2.metrics = metrics_payload
+                        trace_v2.finish_reason = result_payload.get("finish_reason")
+                        trace_v2.finished_at = utc_now()
+                        result_payload["generation_v2"] = {
+                            "contract_version": CONTRACT_V2_VERSION,
+                            "schema_version": "runtime-foundation.generation-result.v2",
+                            "execution_binding": trace_v2.execution_binding.to_dict(),
+                            "execution_binding_fingerprint": trace_v2.execution_binding_fingerprint,
+                            "trace": trace_v2.to_dict(),
+                        }
                         trace.status = "completed"
                         trace.metrics = metrics_payload
                         trace.finish_reason = result_payload.get("finish_reason")
@@ -510,6 +921,11 @@ class RuntimeCore:
                         trace.status = "cancelled" if error.get("code") == "cancelled" else "error"
                         trace.error = error
                         trace.finished_at = utc_now()
+                        trace_v2_error = trace.trace_v2
+                        if trace_v2_error is not None:
+                            trace_v2_error.status = trace.status
+                            trace_v2_error.finished_at = trace.finished_at
+                            trace_v2_error.raw_execution_error = error
                         self._last_error = error
                     event.sequence = sequence
                     yield event
@@ -521,6 +937,11 @@ class RuntimeCore:
                 trace.status = "cancelled" if exc.code == "cancelled" else "error"
                 trace.error = error_payload(exc, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
+                trace_v2_error = trace.trace_v2
+                if trace_v2_error is not None:
+                    trace_v2_error.status = trace.status
+                    trace_v2_error.finished_at = trace.finished_at
+                    trace_v2_error.raw_execution_error = trace.error
                 self._last_error = trace.error
                 sequence += 1
                 yield StreamEvent(
@@ -530,11 +951,16 @@ class RuntimeCore:
                     done=True,
                     error=trace.error,
                 )
-            except Exception as exc:
+            except Exception:  # noqa: BLE001 - convert arbitrary adapter failures to stable runtime errors
                 wrapped = EngineRuntimeError("engine streaming failed", details={"engine": selected.name})
                 trace.status = "error"
                 trace.error = error_payload(wrapped, execution_id=trace.execution_id)
                 trace.finished_at = utc_now()
+                trace_v2_error = trace.trace_v2
+                if trace_v2_error is not None:
+                    trace_v2_error.status = trace.status
+                    trace_v2_error.finished_at = trace.finished_at
+                    trace_v2_error.raw_execution_error = trace.error
                 self._last_error = trace.error
                 sequence += 1
                 yield StreamEvent(
@@ -546,8 +972,15 @@ class RuntimeCore:
                 )
             finally:
                 if not completed and trace.status == "running":
-                    trace.status = "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
+                    trace.status = (
+                        "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
+                    )
                     trace.finished_at = utc_now()
+                    trace_v2_error = trace.trace_v2
+                    if trace_v2_error is not None:
+                        trace_v2_error.status = trace.status
+                        trace_v2_error.finished_at = trace.finished_at
+                        trace_v2_error.raw_execution_error = trace.error
                 self._finish_trace(trace)
                 self._end(request.request_id)
 
@@ -588,6 +1021,7 @@ class RuntimeCore:
             status = "loaded"
         else:
             status = "ready"
+        engine_build_identity = _build_identity_payload(selected.build_identity() if selected is not None else None)
         return HealthResult(
             status=status,
             lifecycle_state=state,
@@ -598,6 +1032,11 @@ class RuntimeCore:
             active_request_ids=active,
             host=self.host_profile.to_dict(),
             last_error=last_error,
+            supported_contract_versions=list(SUPPORTED_CONTRACT_VERSIONS),
+            foundation_build_identity=(
+                self.foundation_build_identity.to_dict() if self.foundation_build_identity is not None else None
+            ),
+            engine_build_identity=engine_build_identity,
         ).to_dict()
 
     def runtime_metrics(self) -> dict[str, Any]:
@@ -606,9 +1045,15 @@ class RuntimeCore:
             selected = self._loaded_adapter
             active = list(self._active)
             state = self._state
+        engine_build_identity = _build_identity_payload(selected.build_identity() if selected is not None else None)
         return {
             "contract_version": CONTRACT_VERSION,
             "foundation_version": self.foundation_version,
+            "foundation_build_identity": (
+                self.foundation_build_identity.to_dict() if self.foundation_build_identity is not None else None
+            ),
+            "engine_build_identity": engine_build_identity,
+            "supported_contract_versions": list(SUPPORTED_CONTRACT_VERSIONS),
             "captured_at": utc_now(),
             "lifecycle_state": state.value,
             "loaded_artifact_id": loaded.artifact_id if loaded else None,
