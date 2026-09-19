@@ -79,17 +79,11 @@ def _baseline(tmp_path: Path) -> tuple[ArtifactBindingV2, str]:
 
 
 def test_build_identity_is_canonical_and_validated() -> None:
-    first = BuildIdentityV1.from_components(
-        kind="test-build-v1", components={"z": 1, "a": {"version": "1.0"}}
-    )
-    second = BuildIdentityV1.from_components(
-        kind="test-build-v1", components={"a": {"version": "1.0"}, "z": 1}
-    )
+    first = BuildIdentityV1.from_components(kind="test-build-v1", components={"z": 1, "a": {"version": "1.0"}})
+    second = BuildIdentityV1.from_components(kind="test-build-v1", components={"a": {"version": "1.0"}, "z": 1})
     assert first.fingerprint == second.fingerprint
     assert BuildIdentityV1.from_payload(first.to_dict()) == first
-    changed = BuildIdentityV1.from_components(
-        kind="test-build-v1", components={"a": {"version": "1.1"}, "z": 1}
-    )
+    changed = BuildIdentityV1.from_components(kind="test-build-v1", components={"a": {"version": "1.1"}, "z": 1})
     assert changed.fingerprint != first.fingerprint
     with pytest.raises(ValueError, match="does not match canonical"):
         BuildIdentityV1(kind=first.kind, fingerprint="sha256:" + "0" * 64, components=first.components)
@@ -157,10 +151,14 @@ def test_foundation_build_identity_override_is_structured_and_rejects_version_st
         )
 
 
-def test_mlx_build_identity_observes_both_distributions_and_changes_with_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mlx_build_identity_observes_both_distributions_and_changes_with_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     versions: dict[str, str | None] = {"mlx-lm": "0.20.0", "mlx": "0.28.1"}
     adapter = MLXAdapter()
-    monkeypatch.setattr(adapter, "_modules", lambda: (SimpleNamespace(__version__=None), SimpleNamespace(__version__=None), None))
+    monkeypatch.setattr(
+        adapter, "_modules", lambda: (SimpleNamespace(__version__=None), SimpleNamespace(__version__=None), None)
+    )
     monkeypatch.setattr(adapter, "_version", lambda distribution: versions[distribution])
 
     identity = adapter.build_identity()
@@ -274,7 +272,9 @@ def test_guard_matching_complete_artifact_and_build_identities_then_rejects_mism
         mismatched_foundation.generate(_guarded_request(artifact, expected))
 
 
-def test_guard_unknown_engine_or_foundation_build_is_unresolvable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_guard_unknown_engine_or_foundation_build_is_unresolvable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     artifact, expected = _baseline(tmp_path)
     unknown_engine = RuntimeCore(
         host_profile=HostProfile.mock_windows(),

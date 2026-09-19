@@ -26,7 +26,9 @@ def foundation_package_tree_components(root: str | Path) -> dict[str, Any]:
     if not package_root.is_dir():
         raise ValueError("Foundation package root must be a directory")
     files: list[dict[str, Any]] = []
-    for path in sorted(package_root.rglob("*.py"), key=lambda candidate: candidate.relative_to(package_root).as_posix()):
+    for path in sorted(
+        package_root.rglob("*.py"), key=lambda candidate: candidate.relative_to(package_root).as_posix()
+    ):
         if not path.is_file() or "__pycache__" in path.parts:
             continue
         relative = path.relative_to(package_root).as_posix()
