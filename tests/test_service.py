@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from runtime_foundation import HostProfile, ModelArtifactBinding, RuntimeCore
+from runtime_foundation import (
+    ArtifactBindingV2,
+    ArtifactLocator,
+    ContentIdentity,
+    HostProfile,
+    ModelArtifactBinding,
+    RuntimeCore,
+)
 from runtime_foundation.adapters.mock import MockAdapter
 from runtime_foundation.client import LocalRuntimeClient, RemoteRuntimeError
 from runtime_foundation.errors import RequestCancelledError
@@ -51,7 +58,9 @@ def test_service_api_exposes_contract_version_and_raw_runtime_boundary(tmp_path:
     assert {item["engine"] for item in engines.json()["engines"]} == {"mock", "mlx", "llama.cpp"}
 
     artifact = ModelArtifactBinding("service", str(model), "bin")
-    load = client.post("/models/load", json={"artifact": artifact.to_dict(), "engine": "mock", "consumer_id": "benchmark"})
+    load = client.post(
+        "/models/load", json={"artifact": artifact.to_dict(), "engine": "mock", "consumer_id": "benchmark"}
+    )
     assert load.status_code == 200
     lease_id = load.json()["lease_id"]
 
@@ -101,7 +110,9 @@ def test_service_api_exposes_contract_version_and_raw_runtime_boundary(tmp_path:
     assert bad.status_code == 400
     assert bad.json()["error"]["code"] == "unsupported_runtime_option"
 
-    unload = client.post("/models/unload", json={"artifact_id": "service", "consumer_id": "benchmark", "lease_id": lease_id})
+    unload = client.post(
+        "/models/unload", json={"artifact_id": "service", "consumer_id": "benchmark", "lease_id": lease_id}
+    )
     assert unload.status_code == 200
     assert unload.json()["unloaded"] is True
 
@@ -176,3 +187,23 @@ def test_client_service_round_trip_preserves_retryable_timeout(tmp_path: Path) -
     assert error.details["timeout_ms"] == 5
     assert error.details["timeout_semantics"] == "cooperative"
     assert error.details["execution_id"]
+
+
+def test_client_load_v2_artifact_reaches_service_and_succeeds(tmp_path: Path) -> None:
+    model = tmp_path / "client-v2-artifact.bin"
+    model.write_bytes(b"client v2 artifact fixture")
+    artifact = ArtifactBindingV2(
+        "client-v2-artifact",
+        ArtifactLocator("filesystem", str(model)),
+        ContentIdentity.from_file(model),
+        format="bin",
+    )
+    core = RuntimeCore(host_profile=HostProfile.mock_windows())
+    service_client = TestClient(create_app(core))
+
+    with LocalRuntimeClient(http_client=service_client, base_url="http://127.0.0.1") as client:
+        loaded = client.load(artifact, engine="mock", consumer_id="v2-client")
+
+    assert loaded["lifecycle_state"] == "LOADED"
+    assert loaded["artifact"]["artifact_id"] == artifact.artifact_id
+    assert loaded["consumer_id"] == "v2-client"

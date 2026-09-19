@@ -67,6 +67,12 @@ with LocalRuntimeClient() as runtime:
     raw_result = runtime.generate(request)
 ```
 
+`LocalRuntimeClient.load()` accepts `ModelArtifactBinding`, the v2
+`ArtifactBindingV2`, or a raw artifact dictionary. Both `generate()` and
+`stream()` accept `GenerationRequestV2` and serialize its v2 contract payload
+before sending it to the loopback service; v1 request and artifact objects
+remain supported.
+
 The Benchmark Production Runtime Gate remains the authority for whether a run is valid. It must require observed provenance and its own policy inputs; a Foundation `status=completed` only means the engine completed an execution.
 
 ## Novel Studio

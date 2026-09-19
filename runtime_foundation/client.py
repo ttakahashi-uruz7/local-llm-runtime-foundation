@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Self
 
 import httpx
 
 from .contracts import GenerationRequest, ModelArtifactBinding
+from .contracts_v2 import ArtifactBindingV2, GenerationRequestV2
 from .network import validate_loopback_url
 
 
@@ -48,7 +49,7 @@ class LocalRuntimeClient:
         if self._owns_client:
             self._client.close()
 
-    def __enter__(self) -> "LocalRuntimeClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -62,7 +63,10 @@ class LocalRuntimeClient:
         if response.status_code >= 400:
             raise RemoteRuntimeError(response.status_code, payload)
         if not isinstance(payload, dict):
-            raise RemoteRuntimeError(response.status_code, {"error": {"code": "invalid_remote_response", "message": "response was not an object"}})
+            raise RemoteRuntimeError(
+                response.status_code,
+                {"error": {"code": "invalid_remote_response", "message": "response was not an object"}},
+            )
         return payload
 
     def health(self) -> dict[str, Any]:
@@ -79,12 +83,12 @@ class LocalRuntimeClient:
 
     def load(
         self,
-        artifact: ModelArtifactBinding | dict[str, Any],
+        artifact: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
         *,
         engine: str | None = None,
         consumer_id: str | None = None,
     ) -> dict[str, Any]:
-        binding = artifact.to_dict() if isinstance(artifact, ModelArtifactBinding) else artifact
+        binding = artifact.to_dict() if isinstance(artifact, (ModelArtifactBinding, ArtifactBindingV2)) else artifact
         body: dict[str, Any] = {"artifact": binding}
         if engine is not None:
             body["engine"] = engine
@@ -92,7 +96,9 @@ class LocalRuntimeClient:
             body["consumer_id"] = consumer_id
         return self._decode(self._client.post("/models/load", json=body))
 
-    def unload(self, artifact_id: str | None = None, *, consumer_id: str | None = None, lease_id: str | None = None) -> dict[str, Any]:
+    def unload(
+        self, artifact_id: str | None = None, *, consumer_id: str | None = None, lease_id: str | None = None
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {}
         if artifact_id is not None:
             body["artifact_id"] = artifact_id
@@ -102,11 +108,11 @@ class LocalRuntimeClient:
             body["lease_id"] = lease_id
         return self._decode(self._client.post("/models/unload", json=body))
 
-    def generate(self, request: GenerationRequest | dict[str, Any]) -> dict[str, Any]:
+    def generate(self, request: GenerationRequest | GenerationRequestV2 | dict[str, Any]) -> dict[str, Any]:
         payload = request.to_dict() if isinstance(request, GenerationRequest) else request
         return self._decode(self._client.post("/generate", json=payload))
 
-    def stream(self, request: GenerationRequest | dict[str, Any]) -> Iterator[dict[str, Any]]:
+    def stream(self, request: GenerationRequest | GenerationRequestV2 | dict[str, Any]) -> Iterator[dict[str, Any]]:
         payload = request.to_dict() if isinstance(request, GenerationRequest) else request
         with self._client.stream("POST", "/generate/stream", json=payload) as response:
             if response.status_code >= 400:
