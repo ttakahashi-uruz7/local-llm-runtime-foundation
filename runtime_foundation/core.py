@@ -29,6 +29,7 @@ from .contracts_v2 import (
     CONTRACT_V2_VERSION,
     SUPPORTED_CONTRACT_VERSIONS,
     ArtifactBindingV2,
+    ExecutionGuardVerification,
     ExecutionTraceV2,
     GenerationRequestV2,
     GenerationResultV2,
@@ -36,12 +37,16 @@ from .contracts_v2 import (
     ThinkingMode,
     ThinkingResolution,
     build_execution_binding,
+    is_valid_fingerprint,
 )
 from .errors import (
     ArtifactNotFoundError,
     EngineNotFoundError,
     EngineRuntimeError,
     EngineUnavailableError,
+    ExecutionBindingUnresolvableError,
+    ExecutionGuardMismatchError,
+    InvalidRequestError,
     LoadConflictError,
     ModelNotLoadedError,
     RuntimeBusyError,
@@ -579,6 +584,182 @@ class RuntimeCore:
             ),
         )
 
+    @staticmethod
+    def _guard_details(
+        request: GenerationRequestV2,
+        trace_v2: ExecutionTraceV2,
+        *,
+        mismatch_category: str,
+    ) -> dict[str, Any]:
+        guard = trace_v2.guard
+        assert guard is not None
+        return {
+            "expected_execution_binding_fingerprint": guard.expected_execution_binding_fingerprint,
+            "actual_execution_binding_fingerprint": trace_v2.execution_binding_fingerprint,
+            "expected_runtime_settings_fingerprint": guard.expected_runtime_settings_fingerprint,
+            "actual_runtime_settings_fingerprint": (
+                trace_v2.runtime_settings_binding.exact_settings_fingerprint
+                if trace_v2.runtime_settings_binding
+                else None
+            ),
+            "mismatch_category": mismatch_category,
+            "request_id": request.request_id,
+            "execution_id": trace_v2.execution_id,
+            "generation_started": False,
+        }
+
+    def _verify_execution_guard(self, request: GenerationRequest, trace_v2: ExecutionTraceV2) -> None:
+        """Verify strict v2 expectations after effective settings are bound."""
+
+        if not isinstance(request, GenerationRequestV2) or request.execution_guard is None:
+            return
+
+        guard = request.execution_guard
+        trace_v2.guard = guard
+        expected_execution = guard.expected_execution_binding_fingerprint
+        expected_settings = guard.expected_runtime_settings_fingerprint
+        actual_execution = trace_v2.execution_binding_fingerprint
+        actual_settings = (
+            trace_v2.runtime_settings_binding.exact_settings_fingerprint if trace_v2.runtime_settings_binding else None
+        )
+        error: RuntimeFoundationError
+
+        if expected_execution is None and expected_settings is None:
+            category = "invalid_expectation"
+            details = self._guard_details(request, trace_v2, mismatch_category=category)
+            error = InvalidRequestError(
+                "execution_guard must specify at least one expected fingerprint",
+                details=details,
+            )
+            trace_v2.guard_verification = ExecutionGuardVerification(
+                status="INVALID_EXPECTATION",
+                mismatch_category=category,
+                expected_execution_binding_fingerprint=expected_execution,
+                actual_execution_binding_fingerprint=actual_execution,
+                expected_runtime_settings_fingerprint=expected_settings,
+                actual_runtime_settings_fingerprint=actual_settings,
+                error=error.as_dict(),
+            )
+            raise error
+
+        for field_name, value in (
+            ("expected_execution_binding_fingerprint", expected_execution),
+            ("expected_runtime_settings_fingerprint", expected_settings),
+        ):
+            if value is not None and not is_valid_fingerprint(value):
+                category = "invalid_expectation"
+                details = self._guard_details(request, trace_v2, mismatch_category=category)
+                details["field"] = field_name
+                error = InvalidRequestError(
+                    f"{field_name} must use sha256:<64 lowercase hex characters>",
+                    details=details,
+                )
+                trace_v2.guard_verification = ExecutionGuardVerification(
+                    status="INVALID_EXPECTATION",
+                    mismatch_category=category,
+                    expected_execution_binding_fingerprint=expected_execution,
+                    actual_execution_binding_fingerprint=actual_execution,
+                    expected_runtime_settings_fingerprint=expected_settings,
+                    actual_runtime_settings_fingerprint=actual_settings,
+                    error=error.as_dict(),
+                )
+                raise error
+
+        if expected_execution is not None:
+            binding = trace_v2.execution_binding
+            missing: list[str] = []
+            content = binding.artifact_binding.content_identity
+            if content is None or content.scheme != "complete":
+                missing.append("artifact_binding.content_identity.complete")
+            engine = binding.engine_binding
+            if not engine.family:
+                missing.append("engine_binding.family")
+            if not engine.implementation.id:
+                missing.append("engine_binding.implementation.id")
+            if not engine.implementation.version:
+                missing.append("engine_binding.implementation.version")
+            if not engine.build_identity:
+                missing.append("engine_binding.build_identity")
+            if not engine.adapter_id:
+                missing.append("engine_binding.adapter_id")
+            foundation = binding.foundation_binding
+            if not foundation.contract_version:
+                missing.append("foundation_binding.contract_version")
+            if not foundation.foundation_version:
+                missing.append("foundation_binding.foundation_version")
+            if not foundation.build_identity:
+                missing.append("foundation_binding.build_identity")
+            if not foundation.adapter_id:
+                missing.append("foundation_binding.adapter_id")
+            if actual_execution is None:
+                missing.append("execution_binding_fingerprint")
+            if missing:
+                category = "execution_binding_unresolvable"
+                details = self._guard_details(request, trace_v2, mismatch_category=category)
+                details["unresolvable_fields"] = missing
+                error = ExecutionBindingUnresolvableError(
+                    "actual execution binding cannot be safely certified",
+                    details=details,
+                )
+                trace_v2.guard_verification = ExecutionGuardVerification(
+                    status="UNRESOLVABLE",
+                    mismatch_category=category,
+                    expected_execution_binding_fingerprint=expected_execution,
+                    actual_execution_binding_fingerprint=actual_execution,
+                    expected_runtime_settings_fingerprint=expected_settings,
+                    actual_runtime_settings_fingerprint=actual_settings,
+                    error=error.as_dict(),
+                )
+                raise error
+
+        mismatch: str | None = None
+        if expected_execution is not None and expected_execution != actual_execution:
+            mismatch = "execution_binding_mismatch"
+        if expected_settings is not None and expected_settings != actual_settings:
+            mismatch = "runtime_settings_mismatch" if mismatch is None else "execution_guard_mismatch"
+        if mismatch is not None:
+            details = self._guard_details(request, trace_v2, mismatch_category=mismatch)
+            error = ExecutionGuardMismatchError(
+                "execution guard expectations do not match actual state", details=details
+            )
+            trace_v2.guard_verification = ExecutionGuardVerification(
+                status="MISMATCH",
+                mismatch_category=mismatch,
+                expected_execution_binding_fingerprint=expected_execution,
+                actual_execution_binding_fingerprint=actual_execution,
+                expected_runtime_settings_fingerprint=expected_settings,
+                actual_runtime_settings_fingerprint=actual_settings,
+                error=error.as_dict(),
+            )
+            raise error
+
+        trace_v2.guard_verification = ExecutionGuardVerification(
+            status="MATCH",
+            expected_execution_binding_fingerprint=expected_execution,
+            actual_execution_binding_fingerprint=actual_execution,
+            expected_runtime_settings_fingerprint=expected_settings,
+            actual_runtime_settings_fingerprint=actual_settings,
+            generation_started=False,
+        )
+
+    def _resolve_runtime_and_guard(
+        self,
+        request: GenerationRequest,
+        selected: EngineAdapter,
+        timeout_event: threading.Event,
+        trace: ExecutionTrace,
+    ) -> RuntimeSettingsResolution:
+        """Shared settings-resolution and pre-generation safety path."""
+
+        resolution = selected.resolve_runtime_options(request.runtime_options)
+        self._raise_if_timed_out(request, timeout_event, trace)
+        trace.runtime_settings_resolution = resolution
+        trace.effective_runtime_settings = resolution.effective.to_dict()
+        trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
+        trace_v2.with_runtime_settings(resolution.effective)
+        self._verify_execution_guard(request, trace_v2)
+        return resolution
+
     def _end(self, request_id: str) -> None:
         with self._lock:
             active = self._active.pop(request_id, None)
@@ -601,13 +782,12 @@ class RuntimeCore:
     def generate(self, request: GenerationRequest) -> GenerationResult:
         _, selected, cancel_event, timeout_event, trace = self._begin(request)
         try:
-            resolution: RuntimeSettingsResolution = selected.resolve_runtime_options(request.runtime_options)
-            self._raise_if_timed_out(request, timeout_event, trace)
-            trace.runtime_settings_resolution = resolution
-            trace.effective_runtime_settings = resolution.effective.to_dict()
+            resolution = self._resolve_runtime_and_guard(request, selected, timeout_event, trace)
             trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
-            trace_v2.with_runtime_settings(resolution.effective)
             effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
+            trace_v2.generation_started = True
+            if trace_v2.guard_verification is not None:
+                trace_v2.guard_verification = replace(trace_v2.guard_verification, generation_started=True)
             result = selected.generate(effective_request, cancel_event)
             self._raise_if_timed_out(request, timeout_event, trace)
             if result.metrics.load_duration_ms is None:
@@ -674,14 +854,13 @@ class RuntimeCore:
             completed = False
             terminal_error = False
             try:
-                yield StreamEvent(type="started", request_id=request.request_id, sequence=sequence)
-                resolution = selected.resolve_runtime_options(request.runtime_options)
-                self._raise_if_timed_out(request, timeout_event, trace)
-                trace.runtime_settings_resolution = resolution
-                trace.effective_runtime_settings = resolution.effective.to_dict()
+                resolution = self._resolve_runtime_and_guard(request, selected, timeout_event, trace)
                 trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
-                trace_v2.with_runtime_settings(resolution.effective)
                 effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
+                yield StreamEvent(type="started", request_id=request.request_id, sequence=sequence)
+                trace_v2.generation_started = True
+                if trace_v2.guard_verification is not None:
+                    trace_v2.guard_verification = replace(trace_v2.guard_verification, generation_started=True)
                 for event in selected.stream(effective_request, cancel_event):
                     if event.type == "started":
                         continue

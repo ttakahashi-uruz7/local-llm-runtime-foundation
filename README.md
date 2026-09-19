@@ -51,7 +51,7 @@ The Python client preserves Foundation remote errors without policy reinterpreta
 
 See [RUNTIME_CONTRACT.md](docs/current/RUNTIME_CONTRACT.md) and [INTEGRATION_GUIDE.md](docs/current/INTEGRATION_GUIDE.md).
 
-RAH-1 v2 details are in [RAH1_CONTRACT_V2.md](docs/current/RAH1_CONTRACT_V2.md). v2 separates registry artifact identity, complete/fast content identity, and locator; separates MLX engine family from `mlx-lm` implementation; binds Foundation and effective runtime settings; and exposes deterministic execution fingerprints. The Foundation remains policy-free. A second MLX runtime, real llama.cpp execution, LM Studio integration, and production performance conclusions are deferred.
+RAH-1 v2 details are in [RAH1_CONTRACT_V2.md](docs/current/RAH1_CONTRACT_V2.md), and active RAH-2 guard enforcement is documented in [RAH2_SAFETY_COMPATIBILITY_GATE.md](docs/current/RAH2_SAFETY_COMPATIBILITY_GATE.md). v2 separates registry artifact identity, complete/fast content identity, and locator; separates MLX engine family from `mlx-lm` implementation; binds Foundation and effective runtime settings; exposes deterministic execution fingerprints; and hard-blocks guarded execution before adapter generation when expected state does not match or cannot be certified. The Foundation remains policy-free. A second MLX runtime, real llama.cpp execution, LM Studio integration, and production performance conclusions are deferred.
 
 ## Repository history reference
 

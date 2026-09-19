@@ -15,6 +15,8 @@ evidence is not inferred-upgraded. `GET /health` exposes both values through
 `supported_contracts`). See [RAH1_CONTRACT_V2.md](RAH1_CONTRACT_V2.md) for the
 Execution Binding, Artifact Binding, Engine Binding, Foundation Binding,
 effective settings fingerprint, Thinking v2, and Execution Guard foundations.
+See [RAH2_SAFETY_COMPATIBILITY_GATE.md](RAH2_SAFETY_COMPATIBILITY_GATE.md) for
+the active pre-generation enforcement semantics.
 
 ## First-class contracts
 
@@ -63,6 +65,17 @@ effective settings fingerprint, Thinking v2, and Execution Guard foundations.
 
 Every successful `GenerationResult` and terminal streaming `completed` result includes the first-class `runtime_settings_resolution` object. The same object is present in `ExecutionTrace` and contains `contract_version`, `requested_runtime_settings`, `effective_runtime_settings`, `option_status`, and `warnings`. This is consumer-visible raw evidence from the adapter resolution that produced the execution. Consumers such as Benchmark must persist it and must not reconstruct, infer, or replace `option_status` or `warnings`.
 
+For v2 requests with `execution_guard`, Foundation resolves these effective
+settings before comparing the requested `expected_runtime_settings_fingerprint`
+and before invoking adapter generation. An effective-settings mismatch is a
+hard pre-generation block. A supplied
+`expected_execution_binding_fingerprint` is checked against the actual
+complete Execution Binding, including artifact, engine, Foundation, adapter,
+and effective settings identity. FAST, LEGACY, or unknown identities are not
+strict certified matches. Guard PASS/FAIL evidence is preserved in trace v2;
+guard failure does not invoke `generate` or `stream` and does not emit a
+stream `started` event.
+
 If runtime option resolution fails, Foundation returns the existing machine-readable option error and does not manufacture a successful resolution or an effective-settings payload. The trace retains the requested settings and error context where available.
 
 `context.context_length` is an execution budget, not a silent model reconfiguration. Foundation counts prompt tokens using the selected adapter and enforces `prompt_tokens + max_tokens <= context_length` before and during generation. A violation returns `context_length_exceeded`; Foundation never truncates the prompt or silently reduces the generation budget. MLX advertises this option as a Foundation preflight budget because upstream `mlx-lm` does not expose a generic context-length keyword on `stream_generate`.
@@ -95,6 +108,17 @@ Important error codes include `artifact_not_found`, `engine_not_found`, `engine_
 
 The Foundation Python client raises `RemoteRuntimeError` for remote error responses and preserves the wire `code`, `message`, strict-boolean `retryable`, `details`, and HTTP `status_code`. Consumers such as Benchmark must use this Foundation-provided retryability and must not infer or recreate it from `code`.
 
+Guard errors are mechanical execution verification errors. `invalid_request`
+with `mismatch_category=invalid_expectation` identifies malformed expected
+fingerprints; `execution_guard_mismatch` identifies a resolved difference;
+and `execution_binding_unresolvable` identifies an actual state that cannot be
+safely certified. Foundation does not convert these outcomes into deployment
+eligibility or quality policy.
+
 ## Stream
 
-`POST /generate/stream` returns newline-delimited JSON. The first event is `started`; zero or more `delta` events follow; the terminal event is `completed` with a `GenerationResult` payload or `error` with a `RuntimeError` payload. The service does not convert stream events into a Benchmark score.
+`POST /generate/stream` returns newline-delimited JSON. When the pre-generation
+gate passes, the first event is `started`; zero or more `delta` events follow;
+the terminal event is `completed` with a `GenerationResult` payload. A guard
+failure emits only a terminal `error` event and never emits `started` or a
+token delta. The service does not convert stream events into a Benchmark score.

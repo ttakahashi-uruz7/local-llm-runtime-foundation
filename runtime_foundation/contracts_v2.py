@@ -61,6 +61,12 @@ def canonical_fingerprint(value: Any) -> str:
     return f"sha256:{digest}"
 
 
+def is_valid_fingerprint(value: Any) -> bool:
+    """Return whether *value* uses the current canonical fingerprint format."""
+
+    return isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+
+
 def _required_text(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} is required")
@@ -760,6 +766,32 @@ class ExecutionGuardV1:
         )
 
 
+@dataclass(frozen=True)
+class ExecutionGuardVerification:
+    """Additive evidence for one execution guard decision."""
+
+    status: str
+    mismatch_category: str | None = None
+    expected_execution_binding_fingerprint: str | None = None
+    actual_execution_binding_fingerprint: str | None = None
+    expected_runtime_settings_fingerprint: str | None = None
+    actual_runtime_settings_fingerprint: str | None = None
+    generation_started: bool = False
+    error: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "mismatch_category": self.mismatch_category,
+            "expected_execution_binding_fingerprint": self.expected_execution_binding_fingerprint,
+            "actual_execution_binding_fingerprint": self.actual_execution_binding_fingerprint,
+            "expected_runtime_settings_fingerprint": self.expected_runtime_settings_fingerprint,
+            "actual_runtime_settings_fingerprint": self.actual_runtime_settings_fingerprint,
+            "generation_started": self.generation_started,
+            "error": dict(self.error) if self.error else None,
+        }
+
+
 # Public short spelling for callers that use the contract concept rather than
 # its versioned wire name.
 ExecutionGuard = ExecutionGuardV1
@@ -857,6 +889,8 @@ class ExecutionTraceV2:
     thinking_resolution: ThinkingResolution
     started_at: str
     guard: ExecutionGuardV1 | None = None
+    guard_verification: ExecutionGuardVerification | None = None
+    generation_started: bool = False
     finished_at: str | None = None
     status: str = "running"
     metrics: dict[str, Any] | None = None
@@ -918,6 +952,8 @@ class ExecutionTraceV2:
             else None,
             "thinking_resolution": self.thinking_resolution.to_dict(),
             "execution_guard": self.guard.to_dict() if self.guard else None,
+            "guard_verification": self.guard_verification.to_dict() if self.guard_verification else None,
+            "generation_started": self.generation_started,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "status": self.status,
@@ -994,6 +1030,7 @@ __all__ = [
     "ExecutionBindingV2",
     "ExecutionGuard",
     "ExecutionGuardV1",
+    "ExecutionGuardVerification",
     "ExecutionTraceV2",
     "FoundationBindingV2",
     "GenerationRequestV2",
@@ -1006,4 +1043,5 @@ __all__ = [
     "build_execution_binding",
     "canonical_fingerprint",
     "canonical_json",
+    "is_valid_fingerprint",
 ]

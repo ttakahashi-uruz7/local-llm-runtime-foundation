@@ -74,8 +74,9 @@ Execution Guard v1 carries:
 - `expected_execution_binding_fingerprint`;
 - `expected_runtime_settings_fingerprint`.
 
-RAH-1 records these fields and establishes serialization boundaries. Hard
-pre-generation enforcement is deferred to RAH-2.
+RAH-1 established the serialization boundary. RAH-2 activates the
+pre-generation Safety / Compatibility Gate described in
+[RAH2_SAFETY_COMPATIBILITY_GATE.md](RAH2_SAFETY_COMPATIBILITY_GATE.md).
 
 ## Policy boundary and deferred work
 

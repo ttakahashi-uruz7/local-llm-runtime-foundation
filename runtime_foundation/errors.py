@@ -128,6 +128,16 @@ class ThinkingResolutionError(RuntimeFoundationError):
     http_status = 400
 
 
+class ExecutionGuardMismatchError(RuntimeFoundationError):
+    code = "execution_guard_mismatch"
+    http_status = 409
+
+
+class ExecutionBindingUnresolvableError(RuntimeFoundationError):
+    code = "execution_binding_unresolvable"
+    http_status = 409
+
+
 class RuntimeOptionsSchemaMismatchError(RuntimeFoundationError):
     code = "runtime_options_schema_mismatch"
     http_status = 400

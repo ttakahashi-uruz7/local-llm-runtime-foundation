@@ -42,6 +42,7 @@ from .contracts_v2 import (
     ExecutionBindingV2,
     ExecutionGuard,
     ExecutionGuardV1,
+    ExecutionGuardVerification,
     ExecutionTraceV2,
     FoundationBindingV2,
     GenerationRequestV2,
@@ -53,6 +54,7 @@ from .contracts_v2 import (
     ThinkingResolution,
     canonical_fingerprint,
     canonical_json,
+    is_valid_fingerprint,
 )
 from .core import InferenceManager, RuntimeCore
 from .host import HostProfile
@@ -81,6 +83,7 @@ __all__ = [
     "ExecutionBindingV2",
     "ExecutionGuard",
     "ExecutionGuardV1",
+    "ExecutionGuardVerification",
     "ExecutionTrace",
     "ExecutionTraceV2",
     "FoundationBindingV2",
@@ -114,4 +117,5 @@ __all__ = [
     "UnloadResult",
     "canonical_fingerprint",
     "canonical_json",
+    "is_valid_fingerprint",
 ]
