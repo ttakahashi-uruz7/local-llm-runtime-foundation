@@ -117,6 +117,22 @@ Before commit:
 
 Before calling the Foundation MLX path production validated, run the current Mac runbook, record engine versions/builds, artifact binding, chat-template behavior, load/unload cleanup, cold/warm TTFT, prefill/generation metrics, process footprint, peak memory, memory pressure, swap, cancellation, and failure evidence. No Windows/Mock result can substitute for those observations.
 
+## GitHub Actions Resource Policy
+
+GitHub Actions minutes are a limited resource.
+
+During iterative development, prefer complete local validation from the canonical repository whenever the required checks can be performed locally. Do not intentionally trigger or re-run GitHub Actions merely to test speculative fixes. Investigate a failed remote run first, then fix and validate locally before another remote run whenever local reproduction is possible.
+
+Canonical local validation is:
+
+```powershell
+python -m pytest --basetemp=.pytest-temp
+```
+
+Run it from `C:\Projects\local-llm-runtime-foundation`. The repository currently has no GitHub Actions workflow and zero recorded Actions runs, so do not add a workflow solely for uniformity or convenience. If a future remote-only or final validation gate is necessary, document why it cannot reasonably be replaced locally and use the minimum required run(s).
+
+Actions cost reduction must never be achieved by silently skipping required quality checks. PR creation and PR updates must not be suppressed to save Actions minutes; Pull Requests remain the formal Sol Review surface. GitHub MCP/API use for repository, PR, review, comment, and CI inspection does not itself consume the constrained GitHub-hosted runner resource. Do not rely on `[skip ci]` as a routine policy or repeatedly re-run Actions without a concrete reason.
+
 ## Canonical working repository boundary
 
 - This repository's canonical working copy is `C:\Projects\local-llm-runtime-foundation` only.
