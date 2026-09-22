@@ -36,7 +36,7 @@ The reference mapping is:
 | `temperature` / `top_p` | MLX sampler construction | `unsupported_generation_setting` |
 | `acceleration.backend=auto` | resolved to `metal` | explicit option error if not supported |
 
-The current upstream `mlx-lm` API exposes `load`, `stream_generate`, `GenerationResponse`, chat templates, and the KV/prefill arguments used above. The Foundation implementation still marks real execution as **Mac validation pending** because this Windows host cannot validate API behavior, Metal allocation, cache cleanup, or observed throughput. Build Identity is compatibility provenance, not a performance or production-readiness result.
+The current upstream `mlx-lm` API exposes `load`, `stream_generate`, `GenerationResponse`, chat templates, and the KV/prefill arguments used above. The Foundation execution path has now been validated on a real Apple Silicon Mac for API behavior, Metal allocation, cache cleanup, and observed throughput; see `MAC_PRODUCTION_VALIDATION_RUNBOOK.md`. Windows remains the contract/Mock environment. Build Identity is compatibility provenance, not a performance, model-approval, or Production Eligibility result.
 
 The adapter loads only a consumer-supplied local path. Foundation v1 does not download a model or mutate a registry.
 
