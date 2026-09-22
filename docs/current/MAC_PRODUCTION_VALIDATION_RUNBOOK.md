@@ -1,7 +1,7 @@
 # Mac Production Validation Runbook
 
 - Status: **Canonical / Current**
-- Current state: **REAL MAC PRODUCTION VALIDATION PENDING**
+- Current state: **REAL MAC PRODUCTION VALIDATION COMPLETED**
 
 This runbook is intentionally separate from Windows/Mock development. Passing the Windows test suite is not MLX/Metal production validation.
 
@@ -31,6 +31,21 @@ This runbook is intentionally separate from Windows/Mock development. Passing th
 ## Evidence
 
 Store the raw Foundation `HostProfile`, `EngineCapability`, `LoadResult`, `GenerationResult`/`StreamEvent` sequence, `ExecutionTrace`, and error payload in the consumer's evidence store. Foundation does not create `Production Runtime Profile` or `Deployment Eligibility`.
+
+## Validation record: 2026-09-22
+
+The Foundation real execution path was validated on an Apple Silicon Mac. This record describes Foundation observations only; it does not approve the artifact or create a Benchmark Production Eligibility result.
+
+- Host: Mac Studio `Mac17,14`, Apple M5 Max, 64 GiB Unified Memory, macOS `27.0` (build `26A428`), `arm64`.
+- Engine: Metal GPU execution PASS; `mlx 0.32.2`, `mlx-lm 0.31.3`.
+- Artifact: Qwen3.8-27B MLX 8-bit text-only; provider `Hugging Face / lukaskremla` with the source URI `https://huggingface.co/lukaskremla/Qwen3.8-27B-8bit-MLX-TextOnly`, revision `c8fb201897784269fc6433f0dafd0528e7275b3a`.
+- Foundation complete Content Identity: SHA-256 `2e66eda92f10f7041bb1b43e62983384c0dee0ac8895fb2b9f6bf0d060932e32`.
+- PASS: load, generation, streaming, cancellation, unload, reload, `mlx.core.clear_cache` cleanup, tokenizer chat template, thinking `true`/`false`, context enforcement, quantized KV (`int8`, 8-bit, group size 64), restart/stale lifecycle recovery, repeated execution, traces, and real-model error semantics.
+- Observations: memory pressure `normal`; swap delta `0`; representative cold TTFT approximately 2.6–3.7 seconds and warm TTFT approximately 0.35 seconds; observed generation throughput approximately 18–25 tokens/second.
+- Prompt cache: explicitly unsupported in Foundation v1 because prompt-cache object lineage is not implemented; no silent fallback or false PASS is reported.
+- The stale active-request state after a preflight failure was fixed and regression-tested in PR #10.
+
+The Qwen artifact is a consumer-supplied validation input. Foundation does not own Model Registry authority, Benchmark scoring, Production Eligibility, deployment status, or model approval.
 
 ## Stop conditions
 

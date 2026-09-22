@@ -476,17 +476,24 @@ class MLXAdapter(EngineAdapter):
         _, mlx_lm = self._available()
         with self._lock:
             self._active[request.request_id] = cancel_event
-        started_monotonic = time.perf_counter()
-        metrics = RuntimeMetrics(
-            started_at=utc_now(),
-            measurement_kind="mlx",
-            measurement_provenance="observed",
-            context_length=request.runtime_options.context.context_length,
-        )
-        before = runtime_snapshot()
-        prompt = self._prompt(request, tokenizer)
-        prompt_tokens = max(1, len(getattr(tokenizer, "encode", lambda value: value.split())(prompt)))
-        self._enforce_context_budget(request, prompt_tokens)
+        try:
+            started_monotonic = time.perf_counter()
+            metrics = RuntimeMetrics(
+                started_at=utc_now(),
+                measurement_kind="mlx",
+                measurement_provenance="observed",
+                context_length=request.runtime_options.context.context_length,
+            )
+            before = runtime_snapshot()
+            prompt = self._prompt(request, tokenizer)
+            prompt_tokens = max(1, len(getattr(tokenizer, "encode", lambda value: value.split())(prompt)))
+            self._enforce_context_budget(request, prompt_tokens)
+        except Exception:
+            # Preflight failures happen before the generation try/finally below.
+            # Do not leave a request behind that can make cancel/unload appear busy.
+            with self._lock:
+                self._active.pop(request.request_id, None)
+            raise
         timeout_deadline = (
             time.monotonic() + request.timeout_ms / 1000 if request.timeout_ms is not None else None
         )

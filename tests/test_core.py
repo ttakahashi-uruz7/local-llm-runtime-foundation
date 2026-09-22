@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from runtime_foundation import GenerationRequest, HostProfile, ModelArtifactBinding, RuntimeCore, RuntimeOptions
+from runtime_foundation.adapters.mlx import MLXAdapter
 from runtime_foundation.adapters.mock import MockAdapter
 from runtime_foundation.errors import (
     ArtifactNotFoundError,
@@ -69,7 +70,8 @@ def test_mock_lifecycle_generate_trace_and_unload(tmp_path: Path) -> None:
     assert core.health()["lifecycle_state"] == "UNLOADED"
 
 
-def test_missing_artifact_and_engine_unavailable_are_explicit(tmp_path: Path) -> None:
+def test_missing_artifact_and_engine_unavailable_are_explicit(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(MLXAdapter, "_modules", lambda self: (None, None, "test-controlled unavailable"))
     core, artifact = build_core(tmp_path)
     missing = ModelArtifactBinding("missing", str(tmp_path / "missing.bin"), "bin")
     with pytest.raises(ArtifactNotFoundError):
@@ -80,7 +82,8 @@ def test_missing_artifact_and_engine_unavailable_are_explicit(tmp_path: Path) ->
     assert core.health()["status"] == "error"
 
 
-def test_omitted_engine_never_falls_back_to_mock(tmp_path: Path) -> None:
+def test_omitted_engine_never_falls_back_to_mock(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(MLXAdapter, "_modules", lambda self: (None, None, "test-controlled unavailable"))
     model = tmp_path / "model.safetensors"
     model.write_bytes(b"mlx-shaped fixture")
     mlx_artifact = ModelArtifactBinding("mlx-artifact", str(model), "safetensors")

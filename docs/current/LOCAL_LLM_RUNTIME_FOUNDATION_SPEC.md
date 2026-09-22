@@ -81,4 +81,19 @@ Foundation may report `memory_pressure=critical`, `swap_delta_bytes`, or an engi
 
 ## 7. Windows status
 
-Windows supports contract serialization, Core lifecycle, Mock execution, HTTP/client integration, error semantics, and deterministic tests. Real MLX/Metal/Unified Memory/swap/throughput remains pending on a real Apple Silicon Mac.
+Windows supports contract serialization, Core lifecycle, Mock execution, HTTP/client integration, error semantics, and deterministic tests. Real MLX/Metal execution is validated separately on the Apple Silicon Mac recorded below; Windows results must not be substituted for that validation.
+
+## 8. Real Apple Silicon validation status
+
+Real Apple Silicon Mac Production Validation completed on 2026-09-22 for the Foundation execution path. This is an execution-path observation record, not a Benchmark Production Eligibility decision.
+
+- Host: Mac Studio `Mac17,14`, Apple M5 Max, 64 GiB Unified Memory, macOS `27.0` (build `26A428`), `arm64`.
+- Engine: Metal GPU execution PASS; `mlx 0.32.2`, `mlx-lm 0.31.3`.
+- Consumer-supplied artifact: Qwen3.8-27B MLX 8-bit text-only artifact, provider `Hugging Face / lukaskremla`, source `https://huggingface.co/lukaskremla/Qwen3.8-27B-8bit-MLX-TextOnly`, revision `c8fb201897784269fc6433f0dafd0528e7275b3a`.
+- Foundation complete Content Identity: SHA-256 `2e66eda92f10f7041bb1b43e62983384c0dee0ac8895fb2b9f6bf0d060932e32`.
+- Validated: tokenizer/chat template, thinking `true`/`false`, load, generation, streaming, cancellation, context enforcement, quantized KV (`int8`, 8-bit, group size 64), unload, reload, cleanup, restart recovery, memory/swap observation, and execution traces.
+- Observed host state: memory pressure `normal`; generation swap delta `0`.
+- Prompt cache remains explicitly unsupported in Foundation v1 because prompt-cache object lineage is not implemented.
+- The stale active-request state after preflight failure was fixed and regression-tested in PR #10.
+
+Foundation reports how a supplied artifact was executed. It does not approve models, assign Benchmark status, or determine Production Eligibility; those decisions remain with the consumer authority.
