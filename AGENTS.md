@@ -133,14 +133,23 @@ Run it from `C:\Projects\local-llm-runtime-foundation`. The repository currently
 
 Actions cost reduction must never be achieved by silently skipping required quality checks. PR creation and PR updates must not be suppressed to save Actions minutes; Pull Requests remain the formal Sol Review surface. GitHub MCP/API use for repository, PR, review, comment, and CI inspection does not itself consume the constrained GitHub-hosted runner resource. Do not rely on `[skip ci]` as a routine policy or repeatedly re-run Actions without a concrete reason.
 
-## Canonical working repository boundary
+## Canonical Repository Policy
 
-- This repository's canonical working copy is `C:\Projects\local-llm-runtime-foundation` only.
-- Codex implementation, file changes, Git operations, tests, builds, launchers, and any other repository-targeting operation must run from the canonical working copy only.
-- Do not develop, run Git operations, tests, builds, or launchers from `C:\Users\user\Documents\ChatGPT`, a `RETIRED` repository, a temporary clone, a mirror, a backup clone, or any other non-canonical copy.
-- At the start of each task, verify the repository root, `origin`, current branch, and HEAD.
-- If the actual repository root does not match the canonical path, HARD STOP before making changes, Git operations, tests, builds, or launchers.
-- Do not change the canonical path without explicit user instruction.
+- macOS canonical working copy: `/Users/takahashitoru/Projects/local-llm-runtime-foundation`.
+- Windows canonical working copy: `C:\Projects\local-llm-runtime-foundation`.
+- Codex implementation, file changes, Git operations, tests, builds, launchers, and other repository-targeting operations must use only the path for the executing OS. The Global `~/.codex/AGENTS.md` is authoritative for the complete four-repository canonical path list.
+- Do not create or use a new clone, repository directory copy, `git worktree add`, Codex isolated checkout, temporary / recovery / trapfix repository, or alternate checkout. Do not fall back to `/tmp`, `Documents/ChatGPT`, or any other non-canonical path.
+- A dirty working tree is not a reason to create another clone, worktree, or copy. Preserve existing changes and separate work with ordinary Git branches in this canonical repository.
+- If the canonical path is missing, unavailable, or its state is unknown, do not create a replacement; HARD STOP. Create a repository or worktree only when the user explicitly approves it.
+- At task start, verify repository root, origin, branch, HEAD, and working-tree state. Never perform repository work from a non-canonical path.
+
+## Two-Failed-Fix Root-Cause Escalation Policy
+
+Count one failure attempt only when a cause-based fix is applied and verification shows that the same symptom remains. Re-running the same command, retrying a network request, or rerunning external CI does not count. After two attempts for the same symptom, do not apply a third similar local patch; move to Root-Cause Analysis.
+
+In order, fix the reproduction conditions; list prior hypotheses, fixes, and verification results; separate facts from assumptions; list multiple hypotheses; trace upstream through configuration source, authority / source of truth, execution path, call chain, persisted state, runtime state, environment, and external dependency; compare against a known-good state; collect evidence for the root cause; apply the smallest root-cause fix; recheck the original symptom; and run regression checks for previously resolved related behavior.
+
+Before the root cause is proven, do not stack small condition changes, try/except additions, fallbacks, retries, special cases, or relaxed validation. If the evidence cannot establish the root cause, HARD STOP and do not present an unverified hypothesis as fact.
 
 ## GitHub MCP mandatory operation path
 
@@ -163,4 +172,3 @@ GitHub操作経路の優先順位は次の通りとする。
 2. repository規約で許可されたSourcetree Embedded Gitによるlocal Git操作。
 3. ユーザーが明示的に指定したその他の非browser経路。
 4. GitHub Web UI / browser / Computer Useは原則禁止。上記の明示例外時のみ使用可能。
-
