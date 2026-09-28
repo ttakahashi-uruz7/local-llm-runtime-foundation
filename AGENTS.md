@@ -41,11 +41,12 @@ The MLX adapter is lazy and must remain import-safe on Windows. It must not turn
 
 ## Git
 
-Use Sourcetree Embedded Git only:
+Use an explicitly selected Git executable for the current operating system. Before repository operations, verify that the executable exists, is runnable, and reports its version; use its absolute path so PATH ordering cannot silently select a different implementation.
 
-`C:\Users\user\AppData\Local\Atlassian\Sourcetree\git_local\cmd\git.exe`
+- macOS: use Apple Git at `/usr/bin/git`. Verify it with `/usr/bin/git --version` and confirm that it runs on the current machine architecture. Sourcetree is not required on macOS.
+- Windows: use Sourcetree Embedded Git at `C:\Users\user\AppData\Local\Atlassian\Sourcetree\git_local\cmd\git.exe` when it is installed and executable.
 
-Never switch silently to PATH/system Git. Do not use force push, reset --hard, git clean, history rewrite, or destructive changes to sibling repositories. Do not commit directly to `main`; main merge always requires explicit user approval.
+Do not silently switch to another executable if the selected one is missing or fails verification; stop and resolve the environment or obtain an explicit policy update. The Windows Sourcetree path is not a macOS prerequisite. Do not use force push, reset --hard, git clean, history rewrite, or destructive changes to sibling repositories. Do not commit directly to `main`; main merge always requires explicit user approval.
 
 The Benchmark reference PR #10 remains open. This repository must not close, merge, or repurpose that PR.
 
@@ -162,13 +163,13 @@ GitHub固有の参照・操作では、GitHub MCPを正規かつ最優先の経�
 - GitHub MCPが利用不能・未接続・必要操作を非対応・実際のauthentication / permission / scope拒否で継続不能な場合は、そのGitHub操作をHARD STOPとして報告する。browserへ自動fallbackしない。
 - browser経由のGitHub操作は、HARD STOP報告後にユーザーがその操作について明示的に許可した場合だけ例外的に可能とする。
 - GitHub MCPが利用可能か不明な場合は、browserを開く前に利用可能なtool / MCPを確認する。確認せずWeb UIへ進まない。
-- repository内の通常のlocal Git操作には、本ファイルで別途定義されたSourcetree Embedded Git規約を適用する。GitHub MCP優先規約を理由に、正規local GitをPATH/system Gitへ切り替えない。
+- repository内の通常のlocal Git操作には、本ファイルで別途定義されたOS別Git executable規約を適用する。GitHub MCP優先規約を理由に、正規local Git executableを別の実装へ切り替えない。
 - branch作成、commit、通常push、PR作成・更新、PR comment、CI / check確認等について、既存規約上ユーザー確認不要である場合は、MCP利用を理由に追加確認を要求しない。
 - main / PR merge、auto-merge有効化、force-push、branch / PR削除・close、権限変更、その他既存規約で明示承認が必要な操作は、MCPを使用する場合でも同じ承認境界を維持する。
 
 GitHub操作経路の優先順位は次の通りとする。
 
 1. GitHub MCP。
-2. repository規約で許可されたSourcetree Embedded Gitによるlocal Git操作。
+2. repository規約でOS別に許可されたlocal Git executableによる操作。
 3. ユーザーが明示的に指定したその他の非browser経路。
 4. GitHub Web UI / browser / Computer Useは原則禁止。上記の明示例外時のみ使用可能。
