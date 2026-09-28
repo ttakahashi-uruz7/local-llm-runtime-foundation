@@ -49,6 +49,21 @@ class UnsupportedArtifactLocatorError(RuntimeFoundationError):
     http_status = 400
 
 
+class UnsupportedExecutionInputError(RuntimeFoundationError):
+    code = "unsupported_execution_input"
+    http_status = 400
+
+
+class ArtifactCompatibilityError(RuntimeFoundationError):
+    code = "artifact_incompatible"
+    http_status = 409
+
+
+class ExecutionInputMismatchError(RuntimeFoundationError):
+    code = "execution_input_mismatch"
+    http_status = 409
+
+
 class ModelNotLoadedError(RuntimeFoundationError):
     code = "model_not_loaded"
     http_status = 409

@@ -16,6 +16,8 @@ from ..contracts import (
     RuntimeSettingsResolution,
     StreamEvent,
 )
+from ..contracts_v2 import ExecutionInputV1
+from ..errors import UnsupportedExecutionInputError
 
 
 class EngineAdapter(ABC):
@@ -39,6 +41,21 @@ class EngineAdapter(ABC):
     @abstractmethod
     def load(self, artifact: ModelArtifactBinding) -> dict[str, Any]:
         raise NotImplementedError
+
+    def validate_execution_input(self, execution_input: ExecutionInputV1) -> None:
+        """Preflight a composition before any engine model load is attempted."""
+
+        if execution_input.adapters:
+            raise UnsupportedExecutionInputError(
+                "this engine adapter does not support direct LoRA execution",
+                details={"engine": self.name, "adapter_count": len(execution_input.adapters)},
+            )
+
+    def load_execution_input(self, execution_input: ExecutionInputV1) -> dict[str, Any]:
+        """Load a base-only composition through the existing single-artifact path."""
+
+        self.validate_execution_input(execution_input)
+        return self.load(execution_input.base.to_legacy())
 
     @abstractmethod
     def unload(self, artifact_id: str) -> dict[str, Any]:

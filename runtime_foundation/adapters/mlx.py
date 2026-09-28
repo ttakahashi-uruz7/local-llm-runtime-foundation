@@ -10,9 +10,11 @@ import gc
 import importlib
 import importlib.metadata
 import inspect
+import json
 import platform
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -32,6 +34,7 @@ from ..contracts import (
     utc_now,
 )
 from ..errors import (
+    ArtifactCompatibilityError,
     ArtifactNotFoundError,
     ContextLengthExceededError,
     EngineRuntimeError,
@@ -41,8 +44,9 @@ from ..errors import (
     RuntimeTimeoutError,
     UnsupportedGenerationSettingError,
     UnsupportedRuntimeOptionError,
+    UnsupportedExecutionInputError,
 )
-from ..contracts_v2 import BuildIdentityV1
+from ..contracts_v2 import ADAPTER_LINEAGE_METADATA_KEY, AdapterLineageV1, BuildIdentityV1, ExecutionInputV1
 from ..host import runtime_snapshot
 from .base import EngineAdapter
 
@@ -52,7 +56,10 @@ class MLXAdapter(EngineAdapter):
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._mlx_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="foundation-mlx")
+        self._mlx_thread_id: int | None = None
         self._loaded: ModelArtifactBinding | None = None
+        self._loaded_execution_input: ExecutionInputV1 | None = None
         self._model: Any = None
         self._tokenizer: Any = None
         self._stream_generate: Any = None
@@ -89,6 +96,34 @@ class MLXAdapter(EngineAdapter):
         if mlx is None or mlx_lm is None:
             raise EngineUnavailableError("MLX/Metal adapter is unavailable on this host", details={"engine": self.name, "reason": reason})
         return mlx, mlx_lm
+
+    def _run_on_mlx_thread(self, function: Any) -> Any:
+        """Run MLX stateful operations on the one thread that owns the loaded model."""
+
+        if threading.get_ident() == self._mlx_thread_id:
+            return function()
+
+        def invoke() -> Any:
+            self._mlx_thread_id = threading.get_ident()
+            return function()
+
+        return self._mlx_executor.submit(invoke).result()
+
+    def _iter_on_mlx_thread(self, iterator_factory: Any) -> Iterator[Any]:
+        """Create, advance, and close an MLX generator on its owning thread."""
+
+        sentinel = object()
+        iterator = self._run_on_mlx_thread(lambda: iter(iterator_factory()))
+        try:
+            while True:
+                item = self._run_on_mlx_thread(lambda: next(iterator, sentinel))
+                if item is sentinel:
+                    return
+                yield item
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                self._run_on_mlx_thread(close)
 
     @staticmethod
     def _signature(function: Any) -> Mapping[str, inspect.Parameter]:
@@ -235,9 +270,9 @@ class MLXAdapter(EngineAdapter):
         started = time.perf_counter()
         try:
             if "path_or_hf_repo" in parameters:
-                model, tokenizer = loader(path_or_hf_repo=str(path))
+                model, tokenizer = self._run_on_mlx_thread(lambda: loader(path_or_hf_repo=str(path)))
             else:
-                model, tokenizer = loader(str(path))
+                model, tokenizer = self._run_on_mlx_thread(lambda: loader(str(path)))
         except Exception as exc:
             raise EngineRuntimeError(
                 "MLX model load failed",
@@ -248,9 +283,278 @@ class MLXAdapter(EngineAdapter):
             self._tokenizer = tokenizer
             self._stream_generate = getattr(mlx_lm, "stream_generate")
             self._loaded = artifact
+            self._loaded_execution_input = None
         return {
             "loaded": True,
             "artifact_id": artifact.artifact_id,
+            "load_duration_ms": (time.perf_counter() - started) * 1000,
+            "measurement_provenance": "observed",
+        }
+
+    @staticmethod
+    def _read_json(path: Path, *, role: str) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ArtifactCompatibilityError(
+                f"{role} metadata could not be read as JSON",
+                details={"path": str(path), "reason": str(exc)},
+            ) from exc
+        if not isinstance(value, dict):
+            raise ArtifactCompatibilityError(f"{role} metadata must be a JSON object", details={"path": str(path)})
+        return value
+
+    @staticmethod
+    def _safetensors_shapes(files: list[Path], *, role: str) -> dict[str, list[int]]:
+        try:
+            from safetensors import safe_open
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise EngineUnavailableError(
+                "safetensors metadata reader is unavailable; compatibility cannot be certified",
+                details={"engine": "mlx", "role": role},
+            ) from exc
+        shapes: dict[str, list[int]] = {}
+        for path in files:
+            try:
+                with safe_open(str(path), framework="np", device="cpu") as tensors:
+                    for key in tensors.keys():
+                        shapes[key] = list(tensors.get_slice(key).get_shape())
+            except Exception as exc:  # noqa: BLE001 - normalize parser errors at the adapter boundary
+                raise ArtifactCompatibilityError(
+                    f"{role} safetensors header could not be inspected",
+                    details={"path": str(path), "reason": str(exc)},
+                ) from exc
+        return shapes
+
+    @staticmethod
+    def _target_key(key: str, module: str, suffix: str) -> bool:
+        return key.endswith(f".{module}.{suffix}") or key == f"{module}.{suffix}"
+
+    @classmethod
+    def _base_module_shapes(
+        cls, base_path: Path, modules: tuple[str, ...], expected_quantization: str | None = None
+    ) -> dict[str, dict[str, int]]:
+        config_path = base_path / "config.json"
+        index_path = base_path / "model.safetensors.index.json"
+        if not config_path.is_file():
+            raise ArtifactCompatibilityError("Base model is missing config.json", details={"path": str(config_path)})
+        config = cls._read_json(config_path, role="Base config")
+        if index_path.is_file():
+            index = cls._read_json(index_path, role="Base safetensors index")
+            weight_map = index.get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ArtifactCompatibilityError("Base safetensors index has no weight_map")
+            matched_keys = {
+                key: value
+                for key, value in weight_map.items()
+                if isinstance(key, str)
+                and any(cls._target_key(key, module, "scales") or cls._target_key(key, module, "weight") for module in modules)
+                and isinstance(value, str)
+            }
+            files = sorted({base_path / filename for filename in matched_keys.values()})
+            shapes = cls._safetensors_shapes(files, role="Base")
+            matched_keys = {key: value for key, value in matched_keys.items() if key in shapes}
+        else:
+            files = sorted(base_path.glob("*.safetensors"))
+            if not files:
+                raise ArtifactCompatibilityError("Base has no indexed or single-file safetensors weights")
+            shapes = cls._safetensors_shapes(files, role="Base")
+            matched_keys = {
+                key: "" for key in shapes
+                if any(cls._target_key(key, module, "scales") or cls._target_key(key, module, "weight") for module in modules)
+            }
+        quantization = config.get("quantization_config") or config.get("quantization") or {}
+        group_size = quantization.get("group_size") if isinstance(quantization, dict) else None
+        if isinstance(quantization, dict) and quantization:
+            bits = quantization.get("bits")
+            mode = quantization.get("mode")
+            if (
+                isinstance(bits, bool)
+                or not isinstance(bits, int)
+                or bits <= 0
+                or isinstance(group_size, bool)
+                or not isinstance(group_size, int)
+                or group_size <= 0
+                or not isinstance(mode, str)
+                or not mode.strip()
+            ):
+                raise ArtifactCompatibilityError(
+                    "Base quantization_config must declare positive bits/group_size and a mode",
+                    details={"quantization_config": quantization},
+                )
+            actual_quantization = f"mlx:bits={bits};group_size={group_size};mode={mode.strip().lower()}"
+        else:
+            actual_quantization = "mlx:unquantized"
+        if expected_quantization is not None and expected_quantization != actual_quantization:
+            raise ArtifactCompatibilityError(
+                "Base config quantization does not match the declared direct-execution binding",
+                details={"expected_quantization": expected_quantization, "actual_quantization": actual_quantization},
+            )
+        result: dict[str, dict[str, int]] = {}
+        for module in modules:
+            scale_keys = [key for key in matched_keys if cls._target_key(key, module, "scales")]
+            weight_keys = [key for key in matched_keys if cls._target_key(key, module, "weight")]
+            if scale_keys:
+                if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size <= 0:
+                    raise ArtifactCompatibilityError(
+                        "quantized Base does not expose a valid quantization group_size",
+                        details={"module": module, "group_size": group_size},
+                    )
+                dims = {tuple(shapes[key]) for key in scale_keys}
+                if len(dims) != 1:
+                    raise ArtifactCompatibilityError("Base target module has inconsistent quantized shapes", details={"module": module})
+                output_features, input_groups = next(iter(dims))
+                result[module] = {"in_features": input_groups * group_size, "out_features": output_features}
+            elif weight_keys:
+                dims = {tuple(shapes[key]) for key in weight_keys}
+                if len(dims) != 1:
+                    raise ArtifactCompatibilityError("Base target module has inconsistent weight shapes", details={"module": module})
+                output_features, input_features = next(iter(dims))
+                result[module] = {"in_features": input_features, "out_features": output_features}
+            else:
+                raise ArtifactCompatibilityError(
+                    "Base weights do not contain an adapter target module",
+                    details={"module": module},
+                )
+        return result
+
+    def validate_execution_input(self, execution_input: ExecutionInputV1) -> None:
+        self._available()
+        if len(execution_input.adapters) > 1:
+            raise UnsupportedExecutionInputError(
+                "MLX direct execution supports at most one adapter",
+                details={"adapter_count": len(execution_input.adapters), "maximum_supported": 1},
+            )
+        base_path = Path(execution_input.base.local_path or "")
+        if not base_path.exists():
+            raise ArtifactNotFoundError(
+                "Base artifact path does not exist",
+                details={"role": "base", "artifact_id": execution_input.base.artifact_id, "local_path": str(base_path)},
+            )
+        if not execution_input.adapters:
+            return
+        adapter = execution_input.adapters[0]
+        if adapter.format not in {"mlx-lora", "mlx_lora", "lora"}:
+            raise ArtifactCompatibilityError(
+                "MLX direct execution requires an MLX LoRA adapter format",
+                details={"artifact_id": adapter.artifact_id, "format": adapter.format},
+            )
+        adapter_path = Path(adapter.local_path or "")
+        if not adapter_path.is_dir():
+            raise ArtifactNotFoundError(
+                "Adapter artifact path does not exist or is not a directory",
+                details={"role": "adapter", "artifact_id": adapter.artifact_id, "local_path": str(adapter_path)},
+            )
+        config_path = adapter_path / "adapter_config.json"
+        tensors_path = adapter_path / "adapters.safetensors"
+        if not config_path.is_file() or not tensors_path.is_file():
+            raise ArtifactNotFoundError(
+                "MLX LoRA adapter requires adapter_config.json and adapters.safetensors",
+                details={"artifact_id": adapter.artifact_id, "missing": [str(path) for path in (config_path, tensors_path) if not path.is_file()]},
+            )
+        config = self._read_json(config_path, role="Adapter config")
+        if config.get("fine_tune_type") != "lora":
+            raise ArtifactCompatibilityError(
+                "Adapter config is not a LoRA adapter",
+                details={"artifact_id": adapter.artifact_id, "fine_tune_type": config.get("fine_tune_type")},
+            )
+        lineage = AdapterLineageV1.from_payload(adapter.metadata[ADAPTER_LINEAGE_METADATA_KEY])
+        parameters = config.get("lora_parameters")
+        if not isinstance(parameters, dict):
+            raise ArtifactCompatibilityError("Adapter config is missing lora_parameters")
+        rank = parameters.get("rank")
+        configured_modules = parameters.get("keys")
+        if rank != lineage.rank:
+            raise ArtifactCompatibilityError(
+                "Adapter config rank does not match the supplied lineage",
+                details={"config_rank": rank, "lineage_rank": lineage.rank},
+            )
+        if not isinstance(configured_modules, list) or set(configured_modules) != set(lineage.target_modules):
+            raise ArtifactCompatibilityError(
+                "Adapter config target modules do not match the supplied lineage",
+                details={"config_target_modules": configured_modules, "lineage_target_modules": list(lineage.target_modules)},
+            )
+        adapter_shapes = self._safetensors_shapes([tensors_path], role="Adapter")
+        for module in lineage.target_modules:
+            for factor in ("lora_a", "lora_b"):
+                actual_keys = [key for key in adapter_shapes if self._target_key(key, module, factor)]
+                if not actual_keys:
+                    raise ArtifactCompatibilityError(
+                        "Adapter safetensors are missing a declared target factor",
+                        details={"module": module, "factor": factor},
+                    )
+                actual_shapes = {tuple(adapter_shapes[key]) for key in actual_keys}
+                expected_shape = tuple(lineage.tensor_shapes[module][factor])
+                if actual_shapes != {expected_shape}:
+                    raise ArtifactCompatibilityError(
+                        "Adapter safetensors tensor shape does not match its declared lineage",
+                        details={"module": module, "factor": factor, "expected_shape": list(expected_shape), "actual_shapes": [list(item) for item in sorted(actual_shapes)]},
+                    )
+        actual_base_shapes = self._base_module_shapes(
+            base_path, lineage.target_modules, expected_quantization=execution_input.base.quantization
+        )
+        for module in lineage.target_modules:
+            if actual_base_shapes[module] != execution_input.base.metadata["target_module_shapes"][module]:
+                raise ArtifactCompatibilityError(
+                    "Base safetensors shape does not match its declared compatibility manifest",
+                    details={
+                        "module": module,
+                        "declared_shape": execution_input.base.metadata["target_module_shapes"][module],
+                        "actual_shape": actual_base_shapes[module],
+                    },
+                )
+
+    def load_execution_input(self, execution_input: ExecutionInputV1) -> dict[str, Any]:
+        self.validate_execution_input(execution_input)
+        if not execution_input.adapters:
+            return self.load(execution_input.base.to_legacy())
+        _, mlx_lm = self._available()
+        loader = getattr(mlx_lm, "load", None)
+        if not callable(loader):
+            raise EngineUnavailableError("installed mlx-lm does not expose load", details={"engine": self.name})
+        parameters = self._signature(loader)
+        if not self._supports(parameters, "adapter_path"):
+            raise EngineUnavailableError(
+                "installed mlx-lm load does not expose adapter_path",
+                details={"engine": self.name, "mlx_lm_version": self._version("mlx-lm")},
+            )
+        base_path = execution_input.base.local_path
+        adapter_path = execution_input.adapters[0].local_path
+        if base_path is None or adapter_path is None:
+            raise ArtifactNotFoundError("Base and Adapter require filesystem locators for MLX direct load")
+        kwargs: dict[str, Any] = {"adapter_path": adapter_path}
+        if "path_or_hf_repo" in parameters:
+            kwargs["path_or_hf_repo"] = base_path
+            args: tuple[Any, ...] = ()
+        else:
+            args = (base_path,)
+        started = time.perf_counter()
+        try:
+            model, tokenizer = self._run_on_mlx_thread(lambda: loader(*args, **kwargs))
+        except Exception as exc:
+            raise EngineRuntimeError(
+                "MLX Base plus LoRA direct load failed",
+                details={
+                    "engine": self.name,
+                    "base_artifact_id": execution_input.base.artifact_id,
+                    "adapter_artifact_id": execution_input.adapters[0].artifact_id,
+                    "failure_kind": "direct_load_failure",
+                },
+            ) from exc
+        binding = execution_input.base.to_legacy()
+        with self._lock:
+            self._model = model
+            self._tokenizer = tokenizer
+            self._stream_generate = getattr(mlx_lm, "stream_generate")
+            self._loaded = binding
+            self._loaded_execution_input = execution_input
+        return {
+            "loaded": True,
+            "artifact_id": binding.artifact_id,
+            "execution_input_kind": execution_input.kind,
+            "execution_input_fingerprint": execution_input.fingerprint,
+            "adapter_count": len(execution_input.adapters),
+            "load_mode": "direct_base_plus_adapter",
             "load_duration_ms": (time.perf_counter() - started) * 1000,
             "measurement_provenance": "observed",
         }
@@ -501,8 +805,10 @@ class MLXAdapter(EngineAdapter):
         last_item: Any = None
         try:
             yield StreamEvent(type="started", request_id=request.request_id, sequence=0)
-            iterator = stream_generate(model, tokenizer, prompt, **self._stream_kwargs(request, request.runtime_options, mlx_lm))
-            for sequence, item in enumerate(iterator, start=1):
+            iterator_factory = lambda: stream_generate(
+                model, tokenizer, prompt, **self._stream_kwargs(request, request.runtime_options, mlx_lm)
+            )
+            for sequence, item in enumerate(self._iter_on_mlx_thread(iterator_factory), start=1):
                 if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
                     metrics.timeout = True
                     metrics.finished_at = utc_now()
@@ -645,6 +951,7 @@ class MLXAdapter(EngineAdapter):
             if loaded is None or loaded.artifact_id != artifact_id:
                 return {"unloaded": False, "noop": True, "artifact_id": artifact_id}
             self._loaded = None
+            self._loaded_execution_input = None
             self._model = None
             self._tokenizer = None
             self._stream_generate = None
@@ -654,7 +961,7 @@ class MLXAdapter(EngineAdapter):
             if mlx is not None:
                 clear_cache = getattr(mlx, "clear_cache", None)
                 if callable(clear_cache):
-                    clear_cache()
+                    self._run_on_mlx_thread(clear_cache)
             gc.collect()
         except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError):
             return {

@@ -16,7 +16,10 @@ evidence is not inferred-upgraded. `GET /health` exposes both values through
 Execution Binding, Artifact Binding, Engine Binding, Foundation Binding,
 effective settings fingerprint, Thinking v2, and Execution Guard foundations.
 See [RAH2_SAFETY_COMPATIBILITY_GATE.md](RAH2_SAFETY_COMPATIBILITY_GATE.md) for
-the active pre-generation enforcement semantics.
+the active pre-generation enforcement semantics. See
+[DIRECT_EXECUTION_INPUT_V1.md](DIRECT_EXECUTION_INPUT_V1.md) for the additive
+Base + Adapter Direct input. Single Artifact remains the supported contract
+for Base-only and existing materialized/fused artifacts.
 
 ## First-class contracts
 
@@ -27,6 +30,7 @@ the active pre-generation enforcement semantics.
 | `EngineCapability` | What an installed/available adapter can execute or resolve. |
 | `BuildIdentityV1` | Structured deterministic build provenance: kind, canonical component fingerprint, and components. |
 | `ModelArtifactBinding` | Consumer-supplied artifact id/path/format/hash/revision. |
+| `ExecutionInputV1` | Versioned Base plus zero-or-one Adapter composition using v2 artifact bindings. |
 | `RuntimeOptions` | Requested engine-neutral context/KV/prefill/cache/acceleration settings. |
 | `RuntimeSettingsResolution` | Requested settings, effective settings, option status, warnings. |
 | `GenerationRequest` | Messages, generation controls, artifact id, consumer lease, and runtime options. |
@@ -105,7 +109,7 @@ The metrics payload can include load/unload duration, cold/warm TTFT, prefill to
 }
 ```
 
-Important error codes include `artifact_not_found`, `engine_not_found`, `engine_unavailable`, `engine_runtime_error`, `context_length_exceeded`, `model_not_loaded`, `runtime_busy`, `load_conflict`, `unload_conflict`, `unsupported_runtime_option`, `invalid_runtime_option`, `unsupported_generation_setting`, `cancelled`, and `runtime_timeout`.
+Important error codes include `artifact_not_found`, `engine_not_found`, `engine_unavailable`, `engine_runtime_error`, `context_length_exceeded`, `model_not_loaded`, `runtime_busy`, `load_conflict`, `unload_conflict`, `unsupported_runtime_option`, `invalid_runtime_option`, `unsupported_generation_setting`, `cancelled`, and `runtime_timeout`. Direct execution also uses `unsupported_execution_input` for Adapter counts above one, `artifact_incompatible` for identity/lineage/shape mismatches, and `execution_input_mismatch` when a generation request does not identify the loaded composition.
 
 The Foundation Python client raises `RemoteRuntimeError` for remote error responses and preserves the wire `code`, `message`, strict-boolean `retryable`, `details`, and HTTP `status_code`. Consumers such as Benchmark must use this Foundation-provided retryability and must not infer or recreate it from `code`.
 

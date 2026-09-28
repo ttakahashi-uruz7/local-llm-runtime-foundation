@@ -31,7 +31,7 @@ from ..errors import (
     RuntimeTimeoutError,
     UnsupportedRuntimeOptionError,
 )
-from ..contracts_v2 import BuildIdentityV1
+from ..contracts_v2 import BuildIdentityV1, ExecutionInputV1
 from .base import EngineAdapter
 
 
@@ -111,6 +111,19 @@ class MockAdapter(EngineAdapter):
             self._loaded = artifact
             self._last_metrics = {}
         return {"loaded": True, "artifact_id": artifact.artifact_id, "path_kind": "directory" if path.is_dir() else "file"}
+
+    def validate_execution_input(self, execution_input: ExecutionInputV1) -> None:
+        del execution_input  # Contract construction performs lineage and tensor-shape checks.
+
+    def load_execution_input(self, execution_input: ExecutionInputV1) -> dict[str, Any]:
+        loaded = self.load(execution_input.base.to_legacy())
+        return {
+            **loaded,
+            "execution_input_kind": execution_input.kind,
+            "execution_input_fingerprint": execution_input.fingerprint,
+            "adapter_count": len(execution_input.adapters),
+            "composition_execution": "simulated",
+        }
 
     def unload(self, artifact_id: str) -> dict[str, Any]:
         with self._lock:

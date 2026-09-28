@@ -4,7 +4,7 @@ Local LLM Runtime Foundation is the shared, policy-free execution authority for 
 
 It owns how a local model is observed and executed: host observation, engine capability discovery, model load/unload, generation, streaming, cancellation, effective runtime settings, health, and raw runtime metrics. It does not decide whether a runtime is good, production-ready, publishable, or suitable for a Studio workflow.
 
-Current status: **FOUNDATION DEVELOPMENT READY / REAL MAC PRODUCTION VALIDATION PENDING**.
+Current status: **FOUNDATION DEVELOPMENT READY / REAL MAC PRODUCTION VALIDATION COMPLETED**.
 
 ## Architecture
 
@@ -18,6 +18,14 @@ Foundation Core → MLX Adapter (primary) / Mock Adapter / llama.cpp skeleton
 ```
 
 The service owns one loaded model process. Consumer leases prevent one consumer from unloading or replacing another consumer's loaded artifact. The Core has no dependency on Benchmark Registry, Evidence, Optimizer, Quality, Deployment, Novel, or Learning modules.
+
+Foundation supports two execution modes: the existing Single Artifact binding
+for Base-only and materialized/fused artifacts, and the additive versioned
+Base + Adapter Direct execution input for zero or one consumer-supplied LoRA
+Adapter. Direct execution validates complete identity and compatibility, then
+loads the Base and Adapter without fusing or materializing a new model. The
+Foundation does not own a Model Store or download models. See
+[Direct Execution Input v1](docs/current/DIRECT_EXECUTION_INPUT_V1.md).
 
 ## Development
 

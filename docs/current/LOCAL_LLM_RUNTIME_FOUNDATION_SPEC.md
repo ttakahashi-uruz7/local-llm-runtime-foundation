@@ -15,7 +15,9 @@ The Foundation is the common low-level local execution authority shared by Novel
 RAH-1 adds explicit Artifact, Engine, Foundation, and Runtime Settings bindings
 under `runtime-foundation.contract.v2`; v1 consumers and historical v1 evidence
 remain unchanged. See `RAH1_CONTRACT_V2.md` for the additive execution binding
-and canonical fingerprint foundation.
+and canonical fingerprint foundation. Base + Adapter Direct uses the
+additional `runtime-foundation.execution-input.v1` contract described in
+`DIRECT_EXECUTION_INPUT_V1.md`.
 
 The Foundation is not a fourth Studio and is not a workbench.
 
@@ -56,6 +58,7 @@ When a load request omits an engine, the Core resolves the artifact format to it
 - Engine identity, versions, build observations, capability discovery.
 - Host observation: OS/platform/architecture/hardware/CPU/memory/Metal/MLX/memory pressure/swap.
 - Consumer-supplied artifact binding validation and local path existence.
+- Direct Base/Adapter content identity, lineage, and tensor-shape compatibility validation.
 - Model load/unload, generation, streaming, cancellation, chat-template invocation, and engine-specific option mapping.
 - Requested versus effective runtime settings.
 - Raw runtime metrics and execution traces.
@@ -66,12 +69,12 @@ When a load request omits an engine, the Core resolves the artifact format to it
 - Model Registry authority, artifact validation history, `UNVALIDATED`, production status, or promotion.
 - Runtime Optimizer, candidate generation/scoring, successive halving, Safety Gate, Quality Benchmark, Blind Review, or Deployment eligibility.
 - Novel production configuration, role assignment, publish/rollback, manuscript, or UI.
-- Learning data/training/LoRA/QLoRA/preference learning/learned asset promotion.
+- Learning data, training/SFT/LoRA/QLoRA/preference learning, learned asset promotion, and learned-model policy. Foundation can execute only a consumer-supplied compatible Adapter; it does not train, promote, or assign authority to it.
 - Model download, cloud inference, OS tuning, cluster scheduling, or remote execution.
 
 ## 5. Lifecycle and consumer ownership
 
-The service holds at most one physical artifact/engine pair in v1 and one active generation request. A consumer receives a lease when it loads an artifact. Loading the same artifact from another consumer reuses the physical model and creates a second lease. A consumer cannot unload a lease owned by another consumer. A different artifact cannot replace a loaded artifact until all leases are released. Unload while a request is active returns a conflict.
+The service holds at most one loaded execution composition and one active generation request. The composition is either one Single Artifact or a Direct Base plus zero-or-one Adapter. A consumer receives a lease when it loads a composition. Loading the same composition from another consumer reuses the physical model and creates a second lease. A consumer cannot unload a lease owned by another consumer. A different composition cannot replace a loaded composition until all leases are released. Unload while a request is active returns a conflict. Adapter hot swap while retaining the Base allocation is not guaranteed.
 
 This is a safety boundary, not a scheduling policy.
 

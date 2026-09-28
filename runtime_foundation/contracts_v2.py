@@ -26,7 +26,7 @@ from .contracts import (
     _mapping,
     _non_negative_int,
 )
-from .errors import UnsupportedArtifactLocatorError
+from .errors import ArtifactCompatibilityError, UnsupportedArtifactLocatorError, UnsupportedExecutionInputError
 
 CONTRACT_V2_VERSION = "runtime-foundation.contract.v2"
 GENERATION_REQUEST_V2_VERSION = "runtime-foundation.generation-request.v2"
@@ -35,6 +35,9 @@ EXECUTION_TRACE_V2_VERSION = "runtime-foundation.execution-trace.v2"
 EXECUTION_GUARD_VERSION = "runtime-foundation.execution-guard.v1"
 EXECUTION_BINDING_VERSION = "runtime-foundation.execution-binding.v1"
 BUILD_IDENTITY_VERSION = "runtime-foundation.build-identity.v1"
+EXECUTION_INPUT_VERSION = "runtime-foundation.execution-input.v1"
+ADAPTER_LINEAGE_VERSION = "runtime-foundation.adapter-lineage.v1"
+ADAPTER_LINEAGE_METADATA_KEY = "runtime_foundation_adapter_lineage"
 
 SUPPORTED_CONTRACT_VERSIONS = (CONTRACT_VERSION, CONTRACT_V2_VERSION)
 
@@ -60,6 +63,12 @@ def canonical_fingerprint(value: Any) -> str:
 
     digest = hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def _canonical_copy(value: Any) -> Any:
+    """Return a detached JSON value suitable for stable contract snapshots."""
+
+    return json.loads(canonical_json(value))
 
 
 def is_valid_fingerprint(value: Any) -> bool:
@@ -411,6 +420,383 @@ class ArtifactBindingV2:
         }
 
 
+def _complete_identity(binding: ArtifactBindingV2, role: str) -> ContentIdentity:
+    identity = binding.content_identity
+    if identity is None or identity.algorithm != "sha256" or identity.scheme != ContentIdentityScheme.COMPLETE.value:
+        raise ArtifactCompatibilityError(
+            f"{role} requires a complete SHA-256 content identity",
+            details={"role": role, "artifact_id": binding.artifact_id},
+        )
+    return identity
+
+
+def _positive_shape(value: Any, field_name: str) -> list[int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{field_name} must contain exactly two dimensions")
+    result: list[int] = []
+    for dimension in value:
+        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
+            raise ValueError(f"{field_name} dimensions must be positive integers")
+        result.append(dimension)
+    return result
+
+
+@dataclass(frozen=True)
+class AdapterTargetBaseV1:
+    """Consumer asserted Base lineage for an adapter, with locator provenance only."""
+
+    artifact_id: str
+    content_identity: ContentIdentity
+    revision: str
+    format: str
+    quantization: str
+    model_identity: str
+    tokenizer_identity: str
+    locator: ArtifactLocator | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifact_id", _required_text(self.artifact_id, "target_base.artifact_id"))
+        object.__setattr__(self, "revision", _required_text(self.revision, "target_base.revision"))
+        object.__setattr__(self, "format", _required_text(self.format, "target_base.format").lower())
+        object.__setattr__(self, "quantization", _required_text(self.quantization, "target_base.quantization"))
+        object.__setattr__(self, "model_identity", _required_text(self.model_identity, "target_base.model_identity"))
+        object.__setattr__(
+            self, "tokenizer_identity", _required_text(self.tokenizer_identity, "target_base.tokenizer_identity")
+        )
+        if not isinstance(self.content_identity, ContentIdentity):
+            raise ValueError("target_base.content_identity must be a ContentIdentity")
+        if self.locator is not None and not isinstance(self.locator, ArtifactLocator):
+            raise ValueError("target_base.locator must be an ArtifactLocator")
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> AdapterTargetBaseV1:
+        value = _mapping(payload, "adapter_lineage.target_base")
+        allowed = {
+            "artifact_id", "content_identity", "revision", "format", "quantization",
+            "model_identity", "tokenizer_identity", "locator",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported fields in adapter target_base: {', '.join(unknown)}")
+        return cls(
+            artifact_id=value.get("artifact_id"),
+            content_identity=ContentIdentity.from_payload(value.get("content_identity")),
+            revision=value.get("revision"),
+            format=value.get("format"),
+            quantization=value.get("quantization"),
+            model_identity=value.get("model_identity"),
+            tokenizer_identity=value.get("tokenizer_identity"),
+            locator=ArtifactLocator.from_payload(value["locator"]) if value.get("locator") is not None else None,
+        )
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "content_identity": self.content_identity.to_dict(),
+            "revision": self.revision,
+            "format": self.format,
+            "quantization": self.quantization,
+            "model_identity": self.model_identity,
+            "tokenizer_identity": self.tokenizer_identity,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.canonical_payload()
+        payload["locator"] = self.locator.to_dict() if self.locator else None
+        return payload
+
+
+@dataclass(frozen=True)
+class AdapterLineageV1:
+    target_base: AdapterTargetBaseV1
+    rank: int
+    target_modules: tuple[str, ...]
+    tensor_shapes: dict[str, dict[str, list[int]]]
+    schema_version: str = ADAPTER_LINEAGE_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != ADAPTER_LINEAGE_VERSION:
+            raise ValueError(f"adapter lineage schema_version must be {ADAPTER_LINEAGE_VERSION}")
+        if isinstance(self.rank, bool) or not isinstance(self.rank, int) or self.rank <= 0:
+            raise ValueError("adapter lineage rank must be a positive integer")
+        if not isinstance(self.target_base, AdapterTargetBaseV1):
+            raise ValueError("adapter lineage target_base must be validated")
+        if not isinstance(self.target_modules, (tuple, list)) or not self.target_modules:
+            raise ValueError("adapter lineage target_modules must be a non-empty array")
+        modules = tuple(_required_text(item, "adapter_lineage.target_modules[]") for item in self.target_modules)
+        if len(set(modules)) != len(modules):
+            raise ValueError("adapter lineage target_modules must not contain duplicates")
+        if not isinstance(self.tensor_shapes, dict):
+            raise ValueError("adapter lineage tensor_shapes must be an object")
+        normalized: dict[str, dict[str, list[int]]] = {}
+        if set(self.tensor_shapes) != set(modules):
+            raise ValueError("adapter lineage tensor_shapes must describe every target module exactly once")
+        for module in modules:
+            entry = _mapping(self.tensor_shapes[module], f"adapter_lineage.tensor_shapes.{module}")
+            if set(entry) != {"lora_a", "lora_b"}:
+                raise ValueError(f"adapter lineage tensor_shapes.{module} must contain lora_a and lora_b")
+            normalized[module] = {
+                "lora_a": _positive_shape(entry["lora_a"], f"{module}.lora_a"),
+                "lora_b": _positive_shape(entry["lora_b"], f"{module}.lora_b"),
+            }
+        object.__setattr__(self, "target_modules", modules)
+        object.__setattr__(self, "tensor_shapes", normalized)
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> AdapterLineageV1:
+        value = _mapping(payload, "adapter_lineage")
+        allowed = {"schema_version", "target_base", "rank", "target_modules", "tensor_shapes"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported fields in adapter_lineage: {', '.join(unknown)}")
+        if value.get("schema_version") != ADAPTER_LINEAGE_VERSION:
+            raise ValueError(f"adapter_lineage.schema_version must be {ADAPTER_LINEAGE_VERSION}")
+        modules = value.get("target_modules")
+        if not isinstance(modules, list):
+            raise ValueError("adapter_lineage.target_modules must be an array")
+        return cls(
+            target_base=AdapterTargetBaseV1.from_payload(value.get("target_base")),
+            rank=value.get("rank"),
+            target_modules=tuple(modules),
+            tensor_shapes=value.get("tensor_shapes"),
+            schema_version=value["schema_version"],
+        )
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "target_base": self.target_base.canonical_payload(),
+            "rank": self.rank,
+            "target_modules": list(self.target_modules),
+            "tensor_shapes": _canonical_copy(self.tensor_shapes),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.canonical_payload(),
+            "target_base": self.target_base.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ExecutionInputV1:
+    """Versioned Base plus zero-or-one adapter execution composition."""
+
+    base: ArtifactBindingV2
+    adapters: tuple[ArtifactBindingV2, ...] = ()
+    kind: str = "base_plus_adapters"
+    schema_version: str = EXECUTION_INPUT_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EXECUTION_INPUT_VERSION:
+            raise ValueError(f"execution_input.schema_version must be {EXECUTION_INPUT_VERSION}")
+        if self.kind != "base_plus_adapters":
+            raise ValueError("execution_input.kind must be base_plus_adapters")
+        if not isinstance(self.base, ArtifactBindingV2):
+            raise ValueError("execution_input.base must be an ArtifactBindingV2")
+        if not isinstance(self.adapters, (tuple, list)):
+            raise ValueError("execution_input.adapters must be an array")
+        adapters = tuple(self.adapters)
+        if len(adapters) > 1:
+            raise UnsupportedExecutionInputError(
+                "multiple adapters are not supported by this Foundation execution input version",
+                details={"adapter_count": len(adapters), "maximum_supported": 1},
+            )
+        if any(not isinstance(item, ArtifactBindingV2) for item in adapters):
+            raise ValueError("execution_input.adapters entries must be ArtifactBindingV2 values")
+        if self.base.locator.type != "filesystem":
+            raise UnsupportedArtifactLocatorError(
+                "the current Foundation execution boundary supports filesystem locators only",
+                details={"role": "base", "locator_type": self.base.locator.type},
+            )
+        if self.base.format is None or self.base.quantization is None or self.base.revision is None:
+            raise ArtifactCompatibilityError(
+                "Base binding requires format, quantization, and revision for direct execution",
+                details={"artifact_id": self.base.artifact_id},
+            )
+        _complete_identity(self.base, "base")
+        try:
+            base_metadata = _canonical_copy(self.base.metadata)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Base metadata must be JSON-compatible") from exc
+        for key in ("model_identity", "tokenizer_identity"):
+            if not isinstance(base_metadata.get(key), str) or not base_metadata[key].strip():
+                raise ArtifactCompatibilityError(
+                    f"Base binding requires consumer-supplied {key}",
+                    details={"artifact_id": self.base.artifact_id, "missing_field": f"metadata.{key}"},
+                )
+        shapes = base_metadata.get("target_module_shapes")
+        if len(adapters) == 1 and (not isinstance(shapes, dict) or not shapes):
+            raise ArtifactCompatibilityError(
+                "Base binding requires a target_module_shapes manifest for compatibility validation",
+                details={"artifact_id": self.base.artifact_id},
+            )
+        normalized_shapes: dict[str, dict[str, int]] = {}
+        if shapes is not None and not isinstance(shapes, dict):
+            raise ArtifactCompatibilityError(
+                "Base target_module_shapes manifest must be an object",
+                details={"artifact_id": self.base.artifact_id},
+            )
+        for module, raw_shape in (shapes or {}).items():
+            if not isinstance(module, str) or not module.strip():
+                raise ArtifactCompatibilityError("Base target module names must be non-empty strings")
+            try:
+                shape = _mapping(raw_shape, f"target_module_shapes.{module}")
+                if set(shape) != {"in_features", "out_features"}:
+                    raise ValueError("expected in_features and out_features")
+                dimensions = [shape["in_features"], shape["out_features"]]
+                if any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in dimensions):
+                    raise ValueError("dimensions must be positive integers")
+                normalized_shapes[module] = {"in_features": dimensions[0], "out_features": dimensions[1]}
+            except ValueError as exc:
+                raise ArtifactCompatibilityError(
+                    "Base target module shape manifest is malformed",
+                    details={"module": module, "reason": str(exc)},
+                ) from exc
+        if len(adapters) == 1:
+            adapter = adapters[0]
+            if adapter.locator.type != "filesystem":
+                raise UnsupportedArtifactLocatorError(
+                    "the current Foundation execution boundary supports filesystem locators only",
+                    details={"role": "adapter", "locator_type": adapter.locator.type},
+                )
+            if adapter.format is None or adapter.revision is None:
+                raise ArtifactCompatibilityError(
+                    "Adapter binding requires format and revision for direct execution",
+                    details={"artifact_id": adapter.artifact_id},
+                )
+            _complete_identity(adapter, "adapter")
+            raw_lineage = adapter.metadata.get(ADAPTER_LINEAGE_METADATA_KEY)
+            if not isinstance(raw_lineage, dict):
+                raise ArtifactCompatibilityError(
+                    "Adapter binding requires consumer-supplied versioned Base lineage",
+                    details={"artifact_id": adapter.artifact_id, "missing_field": f"metadata.{ADAPTER_LINEAGE_METADATA_KEY}"},
+                )
+            lineage = AdapterLineageV1.from_payload(raw_lineage)
+            target = lineage.target_base
+            expected_base = {
+                "artifact_id": self.base.artifact_id,
+                "content_identity": self.base.content_identity.to_dict(),
+                "revision": self.base.revision,
+                "format": self.base.format,
+                "quantization": self.base.quantization,
+                "model_identity": base_metadata["model_identity"],
+                "tokenizer_identity": base_metadata["tokenizer_identity"],
+            }
+            actual_base = target.canonical_payload()
+            if actual_base != expected_base:
+                raise ArtifactCompatibilityError(
+                    "Adapter target Base lineage does not match the requested Base",
+                    details={"expected_target_base": expected_base, "adapter_target_base": actual_base},
+                )
+            for module in lineage.target_modules:
+                if module not in normalized_shapes:
+                    raise ArtifactCompatibilityError(
+                        "Adapter targets a module absent from the Base compatibility manifest",
+                        details={"module": module, "artifact_id": self.base.artifact_id},
+                    )
+                target_shape = normalized_shapes[module]
+                factors = lineage.tensor_shapes[module]
+                if factors["lora_a"] != [target_shape["in_features"], lineage.rank] or factors["lora_b"] != [
+                    lineage.rank, target_shape["out_features"]
+                ]:
+                    raise ArtifactCompatibilityError(
+                        "Adapter tensor shapes are incompatible with the target Base module",
+                        details={"module": module, "rank": lineage.rank, "base_shape": target_shape, "adapter_shapes": factors},
+                    )
+        copied_adapters = tuple(
+            ArtifactBindingV2(
+                artifact_id=item.artifact_id,
+                locator=item.locator,
+                content_identity=item.content_identity,
+                format=item.format,
+                quantization=item.quantization,
+                revision=item.revision,
+                metadata=_canonical_copy(item.metadata),
+            )
+            for item in adapters
+        )
+        object.__setattr__(self, "adapters", copied_adapters)
+        object.__setattr__(self, "base", ArtifactBindingV2(
+            artifact_id=self.base.artifact_id,
+            locator=self.base.locator,
+            content_identity=self.base.content_identity,
+            format=self.base.format,
+            quantization=self.base.quantization,
+            revision=self.base.revision,
+            metadata={**base_metadata, "target_module_shapes": normalized_shapes},
+        ))
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> ExecutionInputV1:
+        value = _mapping(payload, "execution_input")
+        allowed = {
+            "contract_version", "schema_version", "kind", "base", "adapters", "execution_input_fingerprint"
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported fields in execution_input: {', '.join(unknown)}")
+        if value.get("contract_version") != CONTRACT_V2_VERSION:
+            raise ValueError(f"execution_input.contract_version must be {CONTRACT_V2_VERSION}")
+        if value.get("schema_version") != EXECUTION_INPUT_VERSION:
+            raise ValueError(f"execution_input.schema_version must be {EXECUTION_INPUT_VERSION}")
+        adapters = value.get("adapters")
+        if not isinstance(adapters, list):
+            raise ValueError("execution_input.adapters must be an array")
+        if len(adapters) > 1:
+            raise UnsupportedExecutionInputError(
+                "multiple adapters are not supported by this Foundation execution input version",
+                details={"adapter_count": len(adapters), "maximum_supported": 1},
+            )
+        parsed = cls(
+            base=ArtifactBindingV2.from_payload(value.get("base")),
+            adapters=tuple(ArtifactBindingV2.from_payload(item) for item in adapters),
+            kind=value.get("kind"),
+        )
+        expected = value.get("execution_input_fingerprint")
+        if expected is not None and expected != parsed.fingerprint:
+            raise ValueError("execution_input_fingerprint does not match execution input")
+        return parsed
+
+    def canonical_payload(self) -> dict[str, Any]:
+        base_identity = {
+            **self.base.canonical_payload(),
+            "model_identity": self.base.metadata["model_identity"],
+            "tokenizer_identity": self.base.metadata["tokenizer_identity"],
+            "target_module_shapes": _canonical_copy(self.base.metadata.get("target_module_shapes", {})),
+        }
+        adapter_payloads = []
+        for index, adapter in enumerate(self.adapters):
+            lineage = AdapterLineageV1.from_payload(adapter.metadata[ADAPTER_LINEAGE_METADATA_KEY])
+            adapter_payloads.append({
+                "role": "lora_adapter",
+                "order": index,
+                "artifact_binding": adapter.canonical_payload(),
+                "lineage": lineage.canonical_payload(),
+            })
+        return {
+            "contract_version": CONTRACT_V2_VERSION,
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "base": base_identity,
+            "adapters": adapter_payloads,
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_fingerprint(self.canonical_payload())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": CONTRACT_V2_VERSION,
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "base": _canonical_copy(self.base.to_dict()),
+            "adapters": [_canonical_copy(item.to_dict()) for item in self.adapters],
+            "execution_input_fingerprint": self.fingerprint,
+        }
+
+
 @dataclass(frozen=True)
 class EngineImplementationBinding:
     id: str
@@ -650,9 +1036,10 @@ class ExecutionBindingV2:
     engine_binding: EngineBindingV2
     foundation_binding: FoundationBindingV2
     runtime_settings_binding: RuntimeSettingsBindingV2 | None
+    execution_input: ExecutionInputV1 | None = None
 
     def canonical_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "contract_version": CONTRACT_V2_VERSION,
             "schema_version": EXECUTION_BINDING_VERSION,
             # Locator is recorded in the trace/artifact binding, but it is
@@ -664,6 +1051,9 @@ class ExecutionBindingV2:
             if self.runtime_settings_binding
             else None,
         }
+        if self.execution_input is not None:
+            payload["execution_input"] = self.execution_input.canonical_payload()
+        return payload
 
     @property
     def fingerprint(self) -> str:
@@ -680,6 +1070,11 @@ class ExecutionBindingV2:
             runtime_settings_binding=(
                 RuntimeSettingsBindingV2.from_payload(value["runtime_settings_binding"])
                 if value.get("runtime_settings_binding") is not None
+                else None
+            ),
+            execution_input=(
+                ExecutionInputV1.from_payload(value["execution_input"])
+                if value.get("execution_input") is not None
                 else None
             ),
         )
@@ -701,6 +1096,8 @@ class ExecutionBindingV2:
             if self.runtime_settings_binding
             else None,
         }
+        if self.execution_input is not None:
+            payload["execution_input"] = self.execution_input.to_dict()
         return {**payload, "execution_binding_fingerprint": self.fingerprint}
 
 
@@ -876,6 +1273,7 @@ class GenerationRequestV2(GenerationRequest):
     thinking_intent: ThinkingIntent = field(default_factory=ThinkingIntent)
     studio_resolved_thinking: ThinkingIntent | None = None
     execution_guard: ExecutionGuardV1 | None = None
+    execution_input: ExecutionInputV1 | None = None
 
     @classmethod
     def from_payload(cls, payload: Any) -> GenerationRequestV2:
@@ -892,6 +1290,7 @@ class GenerationRequestV2(GenerationRequest):
         thinking_intent_payload = legacy_payload.pop("thinking_intent", None)
         studio_payload = legacy_payload.pop("studio_resolved_thinking", None)
         guard_payload = legacy_payload.pop("execution_guard", None)
+        execution_input_payload = legacy_payload.pop("execution_input", None)
         expected_execution = legacy_payload.pop("expected_execution_binding_fingerprint", None)
         expected_settings = legacy_payload.pop("expected_runtime_settings_fingerprint", None)
         base = GenerationRequest.from_payload(legacy_payload)
@@ -927,6 +1326,9 @@ class GenerationRequestV2(GenerationRequest):
             if studio_payload is not None
             else None,
             execution_guard=guard,
+            execution_input=ExecutionInputV1.from_payload(execution_input_payload)
+            if execution_input_payload is not None
+            else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -949,6 +1351,8 @@ class GenerationRequestV2(GenerationRequest):
             payload["expected_runtime_settings_fingerprint"] = (
                 self.execution_guard.expected_runtime_settings_fingerprint
             )
+        if self.execution_input is not None:
+            payload["execution_input"] = self.execution_input.to_dict()
         return payload
 
 
@@ -991,17 +1395,22 @@ class ExecutionTraceV2:
     def runtime_settings_binding(self) -> RuntimeSettingsBindingV2 | None:
         return self.execution_binding.runtime_settings_binding
 
+    @property
+    def execution_input(self) -> ExecutionInputV1 | None:
+        return self.execution_binding.execution_input
+
     def with_runtime_settings(self, options: RuntimeOptions) -> None:
         self.execution_binding = ExecutionBindingV2(
             artifact_binding=self.execution_binding.artifact_binding,
             engine_binding=self.execution_binding.engine_binding,
             foundation_binding=self.execution_binding.foundation_binding,
             runtime_settings_binding=RuntimeSettingsBindingV2.from_effective(options),
+            execution_input=self.execution_binding.execution_input,
         )
 
     def to_dict(self) -> dict[str, Any]:
         binding = self.execution_binding.to_dict()
-        return {
+        payload = {
             "contract_version": CONTRACT_V2_VERSION,
             "schema_version": EXECUTION_TRACE_V2_VERSION,
             "execution_id": self.execution_id,
@@ -1033,6 +1442,9 @@ class ExecutionTraceV2:
             "finish_reason": self.finish_reason,
             "raw_execution_error": self.raw_execution_error,
         }
+        if self.execution_input is not None:
+            payload["execution_input"] = self.execution_input.to_dict()
+        return payload
 
 
 @dataclass
@@ -1070,6 +1482,7 @@ def build_execution_binding(
     foundation_version: str,
     foundation_build_identity: BuildIdentityV1 | None,
     effective_runtime_options: RuntimeOptions | None,
+    execution_input: ExecutionInputV1 | None = None,
 ) -> ExecutionBindingV2:
     return ExecutionBindingV2(
         artifact_binding=artifact
@@ -1087,19 +1500,25 @@ def build_execution_binding(
             adapter_id=adapter_id,
         ),
         runtime_settings_binding=RuntimeSettingsBindingV2.from_effective(effective_runtime_options),
+        execution_input=execution_input,
     )
 
 
 __all__ = [
     "BUILD_IDENTITY_VERSION",
+    "ADAPTER_LINEAGE_METADATA_KEY",
+    "ADAPTER_LINEAGE_VERSION",
     "CONTRACT_V2_VERSION",
     "EXECUTION_BINDING_VERSION",
     "EXECUTION_GUARD_VERSION",
+    "EXECUTION_INPUT_VERSION",
     "EXECUTION_TRACE_V2_VERSION",
     "GENERATION_REQUEST_V2_VERSION",
     "GENERATION_RESULT_V2_VERSION",
     "SUPPORTED_CONTRACT_VERSIONS",
     "ArtifactBindingV2",
+    "AdapterLineageV1",
+    "AdapterTargetBaseV1",
     "ArtifactLocator",
     "BuildIdentityV1",
     "ContentIdentity",
@@ -1107,6 +1526,7 @@ __all__ = [
     "EngineBindingV2",
     "EngineImplementationBinding",
     "ExecutionBindingV2",
+    "ExecutionInputV1",
     "ExecutionGuard",
     "ExecutionGuardV1",
     "ExecutionGuardVerification",

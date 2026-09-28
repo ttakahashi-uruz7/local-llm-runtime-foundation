@@ -30,6 +30,21 @@ identity. The current execution boundary supports filesystem locators only;
 non-filesystem locator types fail explicitly and remain available for future
 extension.
 
+## Base + Adapter Direct execution input
+
+The additive `runtime-foundation.execution-input.v1` schema composes one
+`ArtifactBindingV2` Base with zero or one `ArtifactBindingV2` Adapter. It does
+not replace the single-artifact binding used by v1/v2 clients or existing
+materialized/fused artifacts. Adapter lineage binds the target Base identity
+and revision to the adapter's rank, target modules, and tensor-shape manifest.
+Foundation checks complete local content identity and compatibility before
+MLX load; a mismatch is an explicit Foundation error. The execution-input
+fingerprint excludes locators and includes Base identity, adapter role/order,
+and lineage. The complete Execution Binding additionally includes Engine,
+Foundation, and effective Runtime Settings identity. See
+[`DIRECT_EXECUTION_INPUT_V1.md`](DIRECT_EXECUTION_INPUT_V1.md) for the wire
+schema and MLX boundary.
+
 ## Engine and Foundation Binding
 
 Engine Binding v2 separates:
