@@ -30,6 +30,8 @@ from .contracts_v2 import (
     CONTRACT_V2_VERSION,
     SUPPORTED_CONTRACT_VERSIONS,
     ArtifactBindingV2,
+    ContentIdentity,
+    ExecutionInputV1,
     ExecutionGuardVerification,
     ExecutionTraceV2,
     GenerationRequestV2,
@@ -42,12 +44,14 @@ from .contracts_v2 import (
 )
 from .build_identity import observe_foundation_build_identity
 from .errors import (
+    ArtifactCompatibilityError,
     ArtifactNotFoundError,
     EngineNotFoundError,
     EngineRuntimeError,
     EngineUnavailableError,
     ExecutionBindingUnresolvableError,
     ExecutionGuardMismatchError,
+    ExecutionInputMismatchError,
     InvalidRequestError,
     LoadConflictError,
     ModelNotLoadedError,
@@ -121,6 +125,7 @@ class RuntimeCore:
         self._state = LifecycleState.UNLOADED
         self._loaded_artifact: ModelArtifactBinding | None = None
         self._loaded_artifact_v2: ArtifactBindingV2 | None = None
+        self._loaded_execution_input: ExecutionInputV1 | None = None
         self._loaded_adapter: EngineAdapter | None = None
         self._leases: dict[str, str] = {}
         self._active: dict[str, _ActiveRequest] = {}
@@ -213,17 +218,64 @@ class RuntimeCore:
 
     def load(
         self,
-        artifact: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
+        artifact: ModelArtifactBinding | ArtifactBindingV2 | ExecutionInputV1 | dict[str, Any] | None = None,
         *,
+        execution_input: ExecutionInputV1 | dict[str, Any] | None = None,
         adapter: str | None = None,
         consumer_id: str | None = None,
     ) -> dict[str, Any]:
-        artifact_v2, binding = self._artifact(artifact)
+        if artifact is not None and execution_input is not None:
+            raise InvalidRequestError("provide either artifact or execution_input, not both")
+        candidate = execution_input if execution_input is not None else artifact
+        if candidate is None:
+            raise InvalidRequestError("artifact or execution_input is required")
+        direct_input: ExecutionInputV1 | None
+        if isinstance(candidate, ExecutionInputV1):
+            direct_input = ExecutionInputV1.from_payload(candidate.to_dict())
+        elif isinstance(candidate, dict) and candidate.get("schema_version") == "runtime-foundation.execution-input.v1":
+            try:
+                direct_input = ExecutionInputV1.from_payload(candidate)
+            except ValueError as exc:
+                raise InvalidRequestError(str(exc)) from exc
+        else:
+            direct_input = None
+        if direct_input is not None:
+            artifact_v2, binding = direct_input.base, direct_input.base.to_legacy()
+        else:
+            artifact_v2, binding = self._artifact(cast(Any, candidate))
         if not Path(binding.local_path).exists():
             raise ArtifactNotFoundError(
                 "model artifact path does not exist",
-                details={"artifact_id": binding.artifact_id, "local_path": binding.local_path},
+                details={"role": "base", "artifact_id": binding.artifact_id, "local_path": binding.local_path},
             )
+        if direct_input is not None:
+            identities = [("base", direct_input.base, None)] + [
+                ("adapter", item, index) for index, item in enumerate(direct_input.adapters)
+            ]
+            for role, identity_binding, index in identities:
+                path = identity_binding.local_path
+                if path is None or not Path(path).exists():
+                    raise ArtifactNotFoundError(
+                        f"{role} artifact path does not exist",
+                        details={"role": role, "index": index, "artifact_id": identity_binding.artifact_id, "local_path": path},
+                    )
+                expected_identity = identity_binding.content_identity
+                assert expected_identity is not None  # Enforced by ExecutionInputV1.
+                actual_identity = ContentIdentity.from_file(
+                    path,
+                    scheme="complete",
+                    scope=expected_identity.scope,
+                )
+                if actual_identity != expected_identity:
+                    raise ArtifactCompatibilityError(
+                        f"{role.capitalize()} content does not match the supplied complete content identity",
+                        details={
+                            "role": role,
+                            "artifact_id": identity_binding.artifact_id,
+                            "expected_content_identity": expected_identity.to_dict(),
+                            "actual_content_identity": actual_identity.to_dict(),
+                        },
+                    )
         owner = self._consumer_id(consumer_id)
         selected: EngineAdapter
         try:
@@ -237,11 +289,23 @@ class RuntimeCore:
         with self._lock:
             loaded_adapter = self._loaded_adapter
             if self._loaded_artifact is not None and loaded_adapter is not None:
-                if (
-                    self._loaded_artifact.execution_identity() == binding.execution_identity()
-                    and loaded_adapter is selected
-                ):
+                same_direct_mode = (self._loaded_execution_input is None) == (direct_input is None)
+                same_binding = (
+                    self._loaded_execution_input.fingerprint == direct_input.fingerprint
+                    if same_direct_mode and direct_input is not None and self._loaded_execution_input is not None
+                    else same_direct_mode and self._loaded_artifact.execution_identity() == binding.execution_identity()
+                )
+                if same_binding and loaded_adapter is selected:
                     lease_id = self._leases.setdefault(owner, new_id("lease"))
+                    raw = {
+                        "loaded_once": True,
+                        "loaded_artifact_identity": self._loaded_artifact.execution_identity(),
+                    }
+                    if self._loaded_execution_input is not None:
+                        raw.update({
+                            "execution_input": self._loaded_execution_input.to_dict(),
+                            "execution_input_fingerprint": self._loaded_execution_input.fingerprint,
+                        })
                     result = LoadResult(
                         artifact=self._loaded_artifact,
                         engine=loaded_adapter.identity(),
@@ -249,10 +313,7 @@ class RuntimeCore:
                         lease_id=lease_id,
                         consumer_id=owner,
                         reused=True,
-                        raw={
-                            "loaded_once": True,
-                            "loaded_artifact_identity": self._loaded_artifact.execution_identity(),
-                        },
+                        raw=raw,
                     )
                     return result.to_dict()
                 raise LoadConflictError(
@@ -260,6 +321,9 @@ class RuntimeCore:
                     details={
                         "loaded_artifact": self._loaded_artifact.to_dict(),
                         "requested_artifact": binding.to_dict(),
+                        "loaded_execution_input_fingerprint": self._loaded_execution_input.fingerprint
+                        if self._loaded_execution_input else None,
+                        "requested_execution_input_fingerprint": direct_input.fingerprint if direct_input else None,
                         "active_request_ids": list(self._active),
                         "lease_owners": sorted(self._leases),
                     },
@@ -269,7 +333,7 @@ class RuntimeCore:
             self._state = LifecycleState.LOADING
             started = time.perf_counter()
             try:
-                raw = selected.load(binding)
+                raw = selected.load_execution_input(direct_input) if direct_input is not None else selected.load(binding)
             except RuntimeFoundationError as exc:
                 self._state = LifecycleState.ERROR
                 self._last_error = exc.as_dict()
@@ -282,6 +346,7 @@ class RuntimeCore:
             self._last_load_duration_ms = (time.perf_counter() - started) * 1000
             self._loaded_artifact = binding
             self._loaded_artifact_v2 = artifact_v2
+            self._loaded_execution_input = direct_input
             self._loaded_adapter = selected
             self._leases[owner] = new_id("lease")
             self._state = LifecycleState.LOADED
@@ -293,7 +358,14 @@ class RuntimeCore:
                 lease_id=self._leases[owner],
                 consumer_id=owner,
                 reused=False,
-                raw={**raw, "load_duration_ms": self._last_load_duration_ms},
+                raw={
+                    **raw,
+                    "load_duration_ms": self._last_load_duration_ms,
+                    **({
+                        "execution_input": direct_input.to_dict(),
+                        "execution_input_fingerprint": direct_input.fingerprint,
+                    } if direct_input is not None else {}),
+                },
             )
             return result.to_dict()
 
@@ -360,6 +432,7 @@ class RuntimeCore:
             del self._leases[owner]
             self._loaded_artifact = None
             self._loaded_artifact_v2 = None
+            self._loaded_execution_input = None
             self._loaded_adapter = None
             self._state = LifecycleState.UNLOADED
             return UnloadResult(
@@ -374,6 +447,28 @@ class RuntimeCore:
         loaded, selected = self._loaded_artifact, self._loaded_adapter
         if loaded is None or selected is None:
             raise ModelNotLoadedError("no model artifact is loaded")
+        request_input = request.execution_input if isinstance(request, GenerationRequestV2) else None
+        if request_input is not None:
+            request_input = ExecutionInputV1.from_payload(request_input.to_dict())
+        if self._loaded_execution_input is not None:
+            if request_input is None or request_input.fingerprint != self._loaded_execution_input.fingerprint:
+                raise ExecutionInputMismatchError(
+                    "generation execution input does not match the loaded Base/Adapter composition",
+                    details={
+                        "loaded_execution_input_fingerprint": self._loaded_execution_input.fingerprint,
+                        "requested_execution_input_fingerprint": request_input.fingerprint if request_input else None,
+                        "generation_started": False,
+                    },
+                )
+        elif request_input is not None:
+            raise ExecutionInputMismatchError(
+                "a direct Base/Adapter execution input was supplied for a single-artifact load",
+                details={
+                    "loaded_artifact_id": loaded.artifact_id,
+                    "requested_execution_input_fingerprint": request_input.fingerprint,
+                    "generation_started": False,
+                },
+            )
         if loaded.artifact_id != request.model_artifact_id:
             raise ModelNotLoadedError(
                 "requested artifact is not the loaded artifact",
@@ -490,6 +585,7 @@ class RuntimeCore:
             foundation_version=self.foundation_version,
             foundation_build_identity=self.foundation_build_identity,
             effective_runtime_options=None,
+            execution_input=self._loaded_execution_input,
         )
         return ExecutionTraceV2(
             execution_id=execution_id,
@@ -1022,7 +1118,7 @@ class RuntimeCore:
         else:
             status = "ready"
         engine_build_identity = _build_identity_payload(selected.build_identity() if selected is not None else None)
-        return HealthResult(
+        payload = HealthResult(
             status=status,
             lifecycle_state=state,
             foundation_version=self.foundation_version,
@@ -1038,15 +1134,22 @@ class RuntimeCore:
             ),
             engine_build_identity=engine_build_identity,
         ).to_dict()
+        with self._lock:
+            loaded_input = self._loaded_execution_input
+        if loaded_input is not None:
+            payload["loaded_execution_input_kind"] = loaded_input.kind
+            payload["loaded_execution_input_fingerprint"] = loaded_input.fingerprint
+        return payload
 
     def runtime_metrics(self) -> dict[str, Any]:
         with self._lock:
             loaded = self._loaded_artifact
             selected = self._loaded_adapter
+            loaded_input = self._loaded_execution_input
             active = list(self._active)
             state = self._state
         engine_build_identity = _build_identity_payload(selected.build_identity() if selected is not None else None)
-        return {
+        payload = {
             "contract_version": CONTRACT_VERSION,
             "foundation_version": self.foundation_version,
             "foundation_build_identity": (
@@ -1064,6 +1167,10 @@ class RuntimeCore:
             "host_observation": self.host_profile.to_dict(),
             "adapters": [self.adapters[name].runtime_metrics() for name in sorted(self.adapters)],
         }
+        if loaded_input is not None:
+            payload["loaded_execution_input_kind"] = loaded_input.kind
+            payload["loaded_execution_input_fingerprint"] = loaded_input.fingerprint
+        return payload
 
     def get_execution(self, execution_id: str) -> dict[str, Any] | None:
         with self._lock:

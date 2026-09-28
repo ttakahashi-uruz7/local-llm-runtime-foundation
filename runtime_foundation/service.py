@@ -10,14 +10,23 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .contracts import CONTRACT_VERSION, GenerationRequest, ModelArtifactBinding
-from .contracts_v2 import CONTRACT_V2_VERSION, ArtifactBindingV2, GenerationRequestV2
+from .contracts_v2 import CONTRACT_V2_VERSION, ArtifactBindingV2, ExecutionInputV1, GenerationRequestV2
 from .core import RuntimeCore
 from .errors import InvalidRequestError, RuntimeFoundationError
 from .network import validate_loopback_host
 from .version import FOUNDATION_VERSION
 
 
-def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding | ArtifactBindingV2:
+def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding | ArtifactBindingV2 | ExecutionInputV1:
+    if "execution_input" in body:
+        if "artifact" in body or "artifact_id" in body or "local_path" in body:
+            raise InvalidRequestError("load request must contain either artifact or execution_input, not both")
+        try:
+            return ExecutionInputV1.from_payload(body["execution_input"])
+        except (RuntimeFoundationError, ValueError) as exc:
+            if isinstance(exc, RuntimeFoundationError):
+                raise
+            raise InvalidRequestError(str(exc)) from exc
     candidate = body.get("artifact")
     if candidate is None:
         candidate = {
@@ -59,6 +68,7 @@ def _generation_request(body: dict[str, Any]) -> GenerationRequest:
             or body.get("schema_version") == "runtime-foundation.generation-request.v2"
             or "thinking_intent" in body
             or "execution_guard" in body
+            or "execution_input" in body
         ):
             return GenerationRequestV2.from_payload(body)
         return GenerationRequest.from_payload(body)
@@ -103,6 +113,12 @@ def create_app(core: RuntimeCore | None = None) -> FastAPI:
     @app.post("/models/load")
     def load_model(body: dict[str, Any]) -> dict[str, Any]:
         artifact = _artifact_from_body(body)
+        if isinstance(artifact, ExecutionInputV1):
+            return runtime.load(
+                execution_input=artifact,
+                adapter=body.get("engine") or body.get("adapter"),
+                consumer_id=body.get("consumer_id"),
+            )
         return runtime.load(
             artifact,
             adapter=body.get("engine") or body.get("adapter"),

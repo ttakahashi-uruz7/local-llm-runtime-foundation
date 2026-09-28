@@ -47,6 +47,49 @@ The Foundation real execution path was validated on an Apple Silicon Mac. This r
 
 The Qwen artifact is a consumer-supplied validation input. Foundation does not own Model Registry authority, Benchmark scoring, Production Eligibility, deployment status, or model approval.
 
+## Direct Base + Adapter API gate: 2026-09-28
+
+This focused integration gate exercised the newly versioned execution input
+through `LocalRuntimeClient` → the Foundation loopback HTTP API → Core → MLX
+Adapter → generation → v2 Execution Binding/Trace → unload. The service API
+was hosted in-process by FastAPI's test transport on the same Apple Silicon
+Mac; model loading and inference used the installed MLX/Metal runtime. This
+records direct execution mechanics and does not replace or extend a consumer's
+Production Eligibility decision.
+
+- Host/engine: Mac Studio `Mac17,14`, `arm64`, macOS `27.0` build `26A428`,
+  64 GiB Unified Memory; `mlx 0.32.2`, `mlx-lm 0.31.3`, Metal GPU.
+- Base: consumer-supplied Qwen3.8-27B 8-bit MLX artifact, revision
+  `c8fb201897784269fc6433f0dafd0528e7275b3a`, complete SHA-256
+  `2e66eda92f10f7041bb1b43e62983384c0dee0ac8895fb2b9f6bf0d060932e32`.
+- Adapter: the Learning Studio Mac Gate test Adapter, rank 8, targets
+  `self_attn.q_proj` and `self_attn.v_proj`, complete SHA-256
+  `bb26d0445be4c1600fb957d73ba26b6607e57d76db52047afcfae5b8dfebf299`.
+- PASS: complete Base and Adapter content identity, target Base revision and
+  identity, physical Base quantization config (`8` bits, group size `64`,
+  affine mode), config rank/modules, and actual Base/Adapter safetensors shapes
+  validated before MLX Direct Load. MLX received the Base path and
+  `adapter_path`; generation returned “4. This is the sum of two and two.”
+- `execution_input_fingerprint`:
+  `sha256:d92d2f8d2cf519f1a4692118f5f61ab4e9798b954b09b49c567e918e6e2a0c1f`.
+  The successful trace recorded Execution Binding fingerprint
+  `sha256:a048dd5a361105bb498e49172b835451bd7d0f55d2d7d03714cc7bb016555b80`.
+- Runtime observations: load `3401 ms`; cold TTFT `2437 ms`; prefill 41
+  tokens at `41.40 tokens/s`; generation 12 tokens at `20.36 tokens/s`;
+  MLX-reported peak memory `28,865,260,734 bytes`; memory pressure `normal`;
+  swap was `687,467,397 bytes` before and after (`0` delta).
+- PASS: unload returned `cleanup_status=clean`. Complete Base and Adapter
+  identities were unchanged after execution. The Foundation repository had
+  zero files at least 1 GB before and after; direct fused/materialized artifact
+  count was `0`. No Production access occurred.
+- A first API-path attempt exposed MLX's per-thread stream affinity when load
+  and generation ran on different service worker threads. The MLX Adapter now
+  runs load, stream generator steps, generator close, and cache cleanup on one
+  dedicated thread; this focused Mac gate passed after that fix.
+
+This run did not measure warm TTFT, cancellation, restart recovery, or a
+consumer's full production workload for the direct Adapter composition.
+
 ## Stop conditions
 
 If MLX is unavailable, Metal allocation fails, a context run fails, memory pressure/swap is observed, or cleanup is incomplete, record the raw observation and failure. Do not convert it inside Foundation into a Benchmark verdict. The consumer applies its own current policy.

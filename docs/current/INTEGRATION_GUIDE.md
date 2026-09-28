@@ -7,7 +7,8 @@
 
 ```text
 Consumer
-  │ artifact binding + requested runtime settings + messages
+  │ single-artifact binding or Base + Adapter execution input
+  │ requested runtime settings + messages
   ▼
 Foundation Client → Local Runtime Service → Foundation Core → Adapter
   ▲                                                           │
@@ -20,7 +21,7 @@ When `engine` is omitted on load, Foundation resolves only the engine mapped to 
 
 The unauthenticated v1 service binds to loopback only: `127.0.0.1`, `::1`, or `localhost`. `RUNTIME_FOUNDATION_HOST` rejects `0.0.0.0` and LAN/external addresses. `LocalRuntimeClient` applies the same loopback-only rule to `base_url` at construction time, so remote service access is a future authenticated/TLS milestone rather than a v1 client option.
 
-Foundation does not know a consumer's registry record, quality policy, or production profile. A consumer should store the returned execution trace in its own evidence system if it needs durable lineage.
+Foundation does not know a consumer's registry record, quality policy, or production profile. Consumers provide artifact identity and locator values; Foundation does not own a Model Store or download models. A consumer should store the returned execution trace in its own evidence system if it needs durable lineage.
 
 ### Runtime resolution and cleanup evidence
 
@@ -68,10 +69,20 @@ with LocalRuntimeClient() as runtime:
 ```
 
 `LocalRuntimeClient.load()` accepts `ModelArtifactBinding`, the v2
-`ArtifactBindingV2`, or a raw artifact dictionary. Both `generate()` and
+`ArtifactBindingV2`, a raw artifact dictionary, or the versioned
+`ExecutionInputV1` (as the argument or the `execution_input=` keyword). Both `generate()` and
 `stream()` accept `GenerationRequestV2` and serialize its v2 contract payload
 before sending it to the loopback service; v1 request and artifact objects
 remain supported.
+
+For Base + Adapter Direct, pass `execution_input` to load and include the same
+input in Generation Request v2. Foundation checks content identity and
+compatibility before loading and rejects a generation composition mismatch.
+MLX direct execution does not fuse or materialize. Existing fused/materialized
+artifacts remain on the single-artifact path. The initial contract accepts
+zero or one Adapter; retaining a Base while hot-swapping Adapters is not
+guaranteed. See [DIRECT_EXECUTION_INPUT_V1.md](DIRECT_EXECUTION_INPUT_V1.md)
+for the schema and lineage rules.
 
 The Benchmark Production Runtime Gate remains the authority for whether a run is valid. It must require observed provenance and its own policy inputs; a Foundation `status=completed` only means the engine completed an execution.
 
@@ -81,7 +92,7 @@ Novel uses the same client/service boundary for generation. Novel owns manuscrip
 
 ## Learning Studio
 
-Learning may use the Foundation client to check inference behavior of a learned artifact. Learning owns dataset/training/adapter promotion/model profile semantics. Foundation receives only the artifact binding and runtime request.
+Learning may use the Foundation client to check inference behavior of a learned artifact. Learning owns dataset/training/adapter promotion/model profile semantics. Foundation receives the consumer-supplied Base and optional Adapter bindings plus the runtime request and records execution evidence only.
 
 ## Service API
 
@@ -91,7 +102,7 @@ Learning may use the Foundation client to check inference behavior of a learned 
 | `GET /host` | Host observation. |
 | `GET /engines` | All engine capabilities. |
 | `GET /engines/{engine}/capability` | One capability payload. |
-| `POST /models/load` | Load artifact and create/reuse a consumer lease. |
+| `POST /models/load` | Load a Single Artifact or Base + Adapter execution input and create/reuse a consumer lease. |
 | `POST /models/unload` | Release lease and unload when last lease is released. |
 | `POST /generate` | Complete generation. |
 | `POST /generate/stream` | NDJSON streaming generation. |

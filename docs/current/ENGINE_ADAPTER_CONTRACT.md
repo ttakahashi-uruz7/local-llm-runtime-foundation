@@ -17,6 +17,11 @@ Each adapter implements:
 8. `health()`
 9. `runtime_metrics()`
 
+The optional additive execution-input boundary is `validate_execution_input()`
+followed by `load_execution_input()`. Existing `load(ModelArtifactBinding)`
+remains the path for all single-artifact requests. An adapter that cannot
+execute a supplied composition must return an explicit unsupported error.
+
 The Core never calls an engine library directly. Engine-specific arguments are created only inside the selected adapter.
 
 ## MLX primary adapter
@@ -38,7 +43,14 @@ The reference mapping is:
 
 The current upstream `mlx-lm` API exposes `load`, `stream_generate`, `GenerationResponse`, chat templates, and the KV/prefill arguments used above. The Foundation execution path has now been validated on a real Apple Silicon Mac for API behavior, Metal allocation, cache cleanup, and observed throughput; see `MAC_PRODUCTION_VALIDATION_RUNBOOK.md`. Windows remains the contract/Mock environment. Build Identity is compatibility provenance, not a performance, model-approval, or Production Eligibility result.
 
-The adapter loads only a consumer-supplied local path. Foundation v1 does not download a model or mutate a registry.
+The adapter loads only consumer-supplied local paths. For a one-Adapter
+`ExecutionInputV1`, MLX validates adapter config and safetensors metadata plus
+the Base module dimensions, then calls `mlx_lm.load(base_path,
+adapter_path=adapter_path)`. It does not fuse, save, export, or materialize a
+model. A zero-Adapter execution input and every existing single-artifact input
+use the existing single-path `load` operation. Foundation does not own a Model
+Store, download a model, or mutate a consumer registry. See
+[DIRECT_EXECUTION_INPUT_V1.md](DIRECT_EXECUTION_INPUT_V1.md).
 
 `GenerationRequest.timeout_ms` is enforced cooperatively by the Core deadline and the adapter's cancellation/deadline checks. The adapter must not silently ignore it. MLX peak memory is recorded only when the engine reports a peak value; current process RSS comes from the host observation helper and is not substituted for peak memory.
 

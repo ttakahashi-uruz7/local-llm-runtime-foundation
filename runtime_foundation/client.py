@@ -9,7 +9,7 @@ from typing import Any, Self
 import httpx
 
 from .contracts import GenerationRequest, ModelArtifactBinding
-from .contracts_v2 import ArtifactBindingV2, GenerationRequestV2
+from .contracts_v2 import ArtifactBindingV2, ExecutionInputV1, GenerationRequestV2
 from .network import validate_loopback_url
 
 
@@ -83,13 +83,24 @@ class LocalRuntimeClient:
 
     def load(
         self,
-        artifact: ModelArtifactBinding | ArtifactBindingV2 | dict[str, Any],
+        artifact: ModelArtifactBinding | ArtifactBindingV2 | ExecutionInputV1 | dict[str, Any] | None = None,
         *,
+        execution_input: ExecutionInputV1 | dict[str, Any] | None = None,
         engine: str | None = None,
         consumer_id: str | None = None,
     ) -> dict[str, Any]:
-        binding = artifact.to_dict() if isinstance(artifact, (ModelArtifactBinding, ArtifactBindingV2)) else artifact
-        body: dict[str, Any] = {"artifact": binding}
+        if artifact is not None and execution_input is not None:
+            raise ValueError("provide either artifact or execution_input, not both")
+        candidate = execution_input if execution_input is not None else artifact
+        if candidate is None:
+            raise ValueError("artifact or execution_input is required")
+        if isinstance(candidate, ExecutionInputV1):
+            body: dict[str, Any] = {"execution_input": candidate.to_dict()}
+        elif isinstance(candidate, dict) and candidate.get("schema_version") == "runtime-foundation.execution-input.v1":
+            body = {"execution_input": candidate}
+        else:
+            binding = candidate.to_dict() if isinstance(candidate, (ModelArtifactBinding, ArtifactBindingV2)) else candidate
+            body = {"artifact": binding}
         if engine is not None:
             body["engine"] = engine
         if consumer_id is not None:
