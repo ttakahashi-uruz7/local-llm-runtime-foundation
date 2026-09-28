@@ -965,7 +965,29 @@ class RuntimeCore:
         def iterator() -> Iterator[StreamEvent]:
             sequence = 0
             completed = False
-            terminal_error = False
+            adapter_events: Iterator[StreamEvent] | None = None
+            adapter_events_closed = False
+            finalized = False
+
+            def close_adapter_events() -> None:
+                nonlocal adapter_events_closed
+                if adapter_events_closed:
+                    return
+                adapter_events_closed = True
+                close = getattr(adapter_events, "close", None)
+                if callable(close):
+                    close()
+
+            def finalize() -> None:
+                nonlocal finalized
+                if finalized:
+                    return
+                finalized = True
+                try:
+                    self._finish_trace(trace)
+                finally:
+                    self._end(request.request_id)
+
             try:
                 resolution = self._resolve_runtime_and_guard(request, selected, timeout_event, trace)
                 trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
@@ -974,7 +996,8 @@ class RuntimeCore:
                 trace_v2.generation_started = True
                 if trace_v2.guard_verification is not None:
                     trace_v2.guard_verification = replace(trace_v2.guard_verification, generation_started=True)
-                for event in selected.stream(effective_request, cancel_event):
+                adapter_events = iter(selected.stream(effective_request, cancel_event))
+                for event in adapter_events:
                     if event.type == "started":
                         continue
                     if event.type == "completed" and timeout_event.is_set():
@@ -1008,7 +1031,6 @@ class RuntimeCore:
                         event.result = result_payload
                         completed = True
                     elif event.type == "error":
-                        terminal_error = True
                         error = dict(event.error or {})
                         if timeout_event.is_set() and error.get("code") != "runtime_timeout":
                             error = error_payload(self._timeout_error(request, trace))
@@ -1024,9 +1046,17 @@ class RuntimeCore:
                             trace_v2_error.raw_execution_error = error
                         self._last_error = error
                     event.sequence = sequence
+                    if event.type in {"completed", "error"}:
+                        # Finalize both the engine generator and Core lifecycle before
+                        # exposing a terminal event. HTTP clients commonly stop reading
+                        # as soon as they receive done=true, so cleanup cannot depend on
+                        # the consumer requesting another item from this generator.
+                        close_adapter_events()
+                        finalize()
+                        yield event
+                        return
                     yield event
-                if not terminal_error:
-                    self._raise_if_timed_out(request, timeout_event, trace)
+                self._raise_if_timed_out(request, timeout_event, trace)
             except RuntimeFoundationError as exc:
                 if timeout_event.is_set() and exc.code != "runtime_timeout":
                     exc = self._timeout_error(request, trace)
@@ -1040,13 +1070,17 @@ class RuntimeCore:
                     trace_v2_error.raw_execution_error = trace.error
                 self._last_error = trace.error
                 sequence += 1
-                yield StreamEvent(
+                terminal_event = StreamEvent(
                     type="error",
                     request_id=request.request_id,
                     sequence=sequence,
                     done=True,
                     error=trace.error,
                 )
+                close_adapter_events()
+                finalize()
+                yield terminal_event
+                return
             except Exception:  # noqa: BLE001 - convert arbitrary adapter failures to stable runtime errors
                 wrapped = EngineRuntimeError("engine streaming failed", details={"engine": selected.name})
                 trace.status = "error"
@@ -1059,13 +1093,17 @@ class RuntimeCore:
                     trace_v2_error.raw_execution_error = trace.error
                 self._last_error = trace.error
                 sequence += 1
-                yield StreamEvent(
+                terminal_event = StreamEvent(
                     type="error",
                     request_id=request.request_id,
                     sequence=sequence,
                     done=True,
                     error=trace.error,
                 )
+                close_adapter_events()
+                finalize()
+                yield terminal_event
+                return
             finally:
                 if not completed and trace.status == "running":
                     trace.status = (
@@ -1077,8 +1115,10 @@ class RuntimeCore:
                         trace_v2_error.status = trace.status
                         trace_v2_error.finished_at = trace.finished_at
                         trace_v2_error.raw_execution_error = trace.error
-                self._finish_trace(trace)
-                self._end(request.request_id)
+                try:
+                    close_adapter_events()
+                finally:
+                    finalize()
 
         return iterator()
 

@@ -467,6 +467,95 @@ def test_mlx_direct_load_passes_adapter_path_only_for_composed_load(tmp_path: Pa
     assert generation_thread_ids == [load_thread_ids[0], load_thread_ids[0]]
 
 
+def test_core_cancel_terminal_finalizes_before_consumer_stops_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = _input(tmp_path)
+    load_thread_ids: list[int] = []
+    generation_thread_ids: list[int] = []
+    generator_close_thread_ids: list[int] = []
+    cache_clear_thread_ids: list[int] = []
+
+    class FakeTokenizer:
+        @staticmethod
+        def apply_chat_template(messages: list[dict[str, str]], **_: object) -> str:
+            return "\n".join(message["content"] for message in messages)
+
+        @staticmethod
+        def encode(prompt: str) -> list[int]:
+            return prompt.split()
+
+    tokenizer = FakeTokenizer()
+
+    def fake_load(path_or_hf_repo: str, adapter_path: str | None = None) -> tuple[object, FakeTokenizer]:
+        assert path_or_hf_repo == direct.base.local_path
+        assert adapter_path == direct.adapters[0].local_path
+        load_thread_ids.append(threading.get_ident())
+        return object(), tokenizer
+
+    def fake_stream_generate(
+        _model: object,
+        _tokenizer: FakeTokenizer,
+        _prompt: str,
+        max_tokens: int = 64,
+        prefill_step_size: int | None = None,
+    ):
+        del max_tokens
+        del prefill_step_size
+
+        def items():
+            try:
+                for index in range(8):
+                    generation_thread_ids.append(threading.get_ident())
+                    yield {
+                        "text": f"{' ' if index else ''}token-{index}",
+                        "prompt_tokens": 3,
+                        "generation_tokens": index + 1,
+                        "finish_reason": "stop",
+                    }
+            finally:
+                generator_close_thread_ids.append(threading.get_ident())
+
+        return items()
+
+    fake_mlx = SimpleNamespace(clear_cache=lambda: cache_clear_thread_ids.append(threading.get_ident()))
+    fake_mlx_lm = SimpleNamespace(load=fake_load, stream_generate=fake_stream_generate, __version__="test")
+    adapter = MLXAdapter()
+    monkeypatch.setattr(adapter, "_modules", lambda: (fake_mlx, fake_mlx_lm, None))
+    monkeypatch.setattr(adapter, "validate_execution_input", lambda _: None)
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mlx": adapter})
+    consumer_id = "mlx-cancel-regression"
+    loaded = core.load(execution_input=direct, adapter="mlx", consumer_id=consumer_id)
+
+    request = _generate_request(direct, consumer_id=consumer_id, lease_id=loaded["lease_id"])
+    events = core.stream(request)
+    first_event = next(events)
+    assert first_event.type == "started", first_event.to_dict()
+    assert next(events).type == "delta"
+    assert core.cancel(request.request_id)["cancelled"] is True
+    terminal = next(events)
+    assert terminal.type == "error"
+    assert (terminal.error or {}).get("code") == "cancelled"
+
+    # The simulated HTTP client consumes done=true then stops immediately; it
+    # neither asks for another event nor explicitly closes the response iterator.
+    assert core.health()["lifecycle_state"] == "LOADED"
+    assert core.health()["active_request_ids"] == []
+    assert adapter.runtime_metrics()["active_request_ids"] == []
+    assert generator_close_thread_ids == [adapter._mlx_thread_id]
+
+    next_request = _generate_request(direct, consumer_id=consumer_id, lease_id=loaded["lease_id"])
+    generated = core.generate(next_request)
+    assert generated.text == "token-0 token-1 token-2 token-3 token-4 token-5 token-6 token-7"
+    assert core.unload(direct.base.artifact_id, consumer_id=consumer_id, lease_id=loaded["lease_id"])["unloaded"]
+    assert cache_clear_thread_ids == [adapter._mlx_thread_id]
+    assert load_thread_ids == [adapter._mlx_thread_id]
+    assert generation_thread_ids
+    assert set(generation_thread_ids) == {adapter._mlx_thread_id}
+    events.close()
+    adapter._mlx_executor.shutdown(wait=True)
+
+
 def test_mlx_preflight_checks_actual_adapter_and_base_tensor_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     direct = _input(tmp_path)
     base_dir = Path(direct.base.local_path).parent / "mlx-base"
