@@ -58,9 +58,23 @@ Store, download a model, or mutate a consumer registry. See
 
 Mock is deterministic and explicitly labels `measurement_kind=mock` and `measurement_provenance=simulated`. It exercises contract/lifecycle/stream/cancel behavior without fabricating Apple memory, Metal, swap, or production throughput observations.
 
-## llama.cpp boundary
+## llama.cpp formal adapter
 
-`llama.cpp` / GGUF has a capability and error boundary in v1. Production GGUF execution is not required for this milestone.
+`llama.cpp` is a first-class Execution Engine and `gguf` is its Artifact
+Format; the two names are not interchangeable. `llama-cpp-python` and its
+bundled native library are an optional dependency selected by the formal design
+in [LLAMA_CPP_RUNTIME_DESIGN.md](LLAMA_CPP_RUNTIME_DESIGN.md). The adapter
+validates GGUF metadata and content identity, uses only a metadata-selected
+chat template, and keeps native arguments inside the adapter boundary.
+
+V3 capabilities report load-scoped context/batch/thread/KV/offload controls
+only where they are supported and observed. Requested, resolved, and effective
+values remain distinct. Python-visible errors are normalized. The adapter
+runs in the Foundation process, so native crashes are not isolated or promised
+to be caught. Streaming, cancellation, and timeout are cooperative between
+native iterator steps. See
+[LLAMA_CPP_RUNTIME_DESIGN.md](LLAMA_CPP_RUNTIME_DESIGN.md) and
+[DUAL_RUNTIME_CONTRACT_V3.md](DUAL_RUNTIME_CONTRACT_V3.md).
 
 ## Reference sources
 

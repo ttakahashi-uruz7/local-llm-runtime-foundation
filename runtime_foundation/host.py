@@ -235,6 +235,25 @@ def _darwin_memory_pressure() -> str | None:
     return "normal"
 
 
+def host_metal_capability(system_name: str | None = None) -> tuple[bool | None, str]:
+    """Observe host-level Metal support independently of MLX's selected device."""
+
+    system = _normalize_platform(system_name or platform_module.system())
+    if system != "darwin":
+        return False, "Metal is a macOS host capability"
+    output = _command_output("system_profiler", "SPDisplaysDataType", timeout=8.0)
+    if not output:
+        return None, "system_profiler did not provide a host Metal observation"
+    matches = re.findall(r"Metal Support:\s*([^\r\n]+)", output, flags=re.IGNORECASE)
+    if not matches:
+        return None, "system_profiler output did not contain a Metal Support field"
+    if any("not supported" in value.lower() or value.strip().lower() in {"no", "none"} for value in matches):
+        return False, "system_profiler reports that the host GPU does not support Metal"
+    if any("metal" in value.lower() for value in matches):
+        return True, "system_profiler reports host Metal support"
+    return None, "system_profiler returned an unrecognized Metal support value"
+
+
 @dataclass(frozen=True)
 class HostProfile:
     """A point-in-time host observation.  It intentionally has no target label."""

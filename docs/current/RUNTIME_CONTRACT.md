@@ -21,6 +21,23 @@ the active pre-generation enforcement semantics. See
 Base + Adapter Direct input. Single Artifact remains the supported contract
 for Base-only and existing materialized/fused artifacts.
 
+## Contract v3: separated runtime options and dual engines
+
+`runtime-foundation.contract.v3` adds separate `LoadOptions`,
+`GenerationOptions`, and `ExecutionConstraints`, plus v3 Execution Binding,
+Evidence, Trace, and result schemas. It leaves v1/v2 payloads and fingerprint
+semantics intact. Load context allocation and the Foundation-enforced context
+budget are different values. Requested, resolved, and effective values are
+recorded independently. See [DUAL_RUNTIME_CONTRACT_V3.md](DUAL_RUNTIME_CONTRACT_V3.md)
+for the wire contract and lifecycle, and
+[LLAMA_CPP_RUNTIME_DESIGN.md](LLAMA_CPP_RUNTIME_DESIGN.md) for the selected
+native binding and its cancellation/crash guarantees.
+
+MLX and `llama.cpp` are first-class engine families. `gguf` is an artifact
+format, with `llama.cpp` as its default engine; explicit engine selection still
+requires adapter compatibility validation. `ggml` is outside the v3 execution
+contract.
+
 ## First-class contracts
 
 | Contract | Role |

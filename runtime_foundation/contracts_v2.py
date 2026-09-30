@@ -27,6 +27,7 @@ from .contracts import (
     _non_negative_int,
 )
 from .errors import ArtifactCompatibilityError, UnsupportedArtifactLocatorError, UnsupportedExecutionInputError
+from .engines import normalize_engine_identifier
 
 CONTRACT_V2_VERSION = "runtime-foundation.contract.v2"
 GENERATION_REQUEST_V2_VERSION = "runtime-foundation.generation-request.v2"
@@ -907,12 +908,12 @@ class EngineBindingV2:
         adapter_id: str,
         build_identity: BuildIdentityV1 | None = None,
     ) -> EngineBindingV2:
-        engine = _required_text(getattr(identity, "engine", None), "engine")
+        engine = normalize_engine_identifier(_required_text(getattr(identity, "engine", None), "engine"))
         if engine == "mlx":
             family, implementation_id = "mlx", "mlx-lm"
         elif engine == "mock":
             family, implementation_id = "mock", "mock-runtime"
-        elif engine in {"llama.cpp", "llama_cpp"}:
+        elif engine == "llama.cpp":
             family, implementation_id = "llama.cpp", "llama.cpp"
         else:
             family, implementation_id = engine, engine

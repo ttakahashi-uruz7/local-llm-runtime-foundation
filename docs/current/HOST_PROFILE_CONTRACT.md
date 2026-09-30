@@ -26,6 +26,16 @@
 
 The profile intentionally does not include `runtime_mode=production-mac`, `production_eligible`, memory thresholds, or target policy. Benchmark may interpret these facts within its own authority.
 
+## V3 execution capability
+
+The additive v3 host observation keeps `metal_available` unchanged: it still
+means that the MLX default device is Metal-backed. `/v3/host` separately
+reports host Apple Silicon/Metal, MLX availability/default-device Metal,
+llama.cpp availability, the loaded llama.cpp build's Metal capability, and
+the selected execution acceleration. A host with Metal does not prove that a
+llama.cpp build includes Metal or that a particular request used it. Unknown
+native build evidence remains `unknown`.
+
 ## Windows behavior
 
 Windows detection is supported for development. MLX/Metal/Unified Memory fields remain unavailable. The Mock profile is used in tests to avoid treating the host's actual Windows memory as a production observation.

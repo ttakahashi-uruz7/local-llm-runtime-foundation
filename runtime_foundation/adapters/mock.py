@@ -274,6 +274,10 @@ class MockAdapter(EngineAdapter):
         words = f"{prefix}: {prompt}".split()
         return " ".join(words[: request.max_tokens])
 
+    def count_prompt_tokens_v3(self, request: Any) -> int | None:
+        legacy = self._legacy_v2_request(request, request.generation_options)
+        return self._prompt_tokens(legacy)
+
     @staticmethod
     def _prompt_tokens(request: GenerationRequest) -> int:
         return max(1, sum(len(message["content"].split()) for message in request.messages))

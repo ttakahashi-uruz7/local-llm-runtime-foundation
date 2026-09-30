@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "local-llm-runtime-foundation"
 version = "0.2.0"
-description = "Policy-free local LLM execution foundation for MLX and future llama.cpp consumers"
+description = "Policy-free local LLM execution foundation for MLX and llama.cpp consumers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,6 +17,9 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=8,<9",
+]
+llama-cpp = [
+    "llama-cpp-python>=0.3.35,<0.4",
 ]
 
 [tool.setuptools.packages.find]

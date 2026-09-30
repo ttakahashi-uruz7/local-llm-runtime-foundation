@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .contracts import CONTRACT_VERSION, GenerationRequest, ModelArtifactBinding
 from .contracts_v2 import CONTRACT_V2_VERSION, ArtifactBindingV2, ExecutionInputV1, GenerationRequestV2
+from .contracts_v3 import CONTRACT_V3_VERSION, GenerationRequestV3, LoadOptions
 from .core import RuntimeCore
 from .errors import InvalidRequestError, RuntimeFoundationError
 from .network import validate_loopback_host
@@ -61,8 +62,13 @@ def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding | Artifact
         raise InvalidRequestError(str(exc)) from exc
 
 
-def _generation_request(body: dict[str, Any]) -> GenerationRequest:
+def _generation_request(body: dict[str, Any]) -> GenerationRequest | GenerationRequestV2 | GenerationRequestV3:
     try:
+        if (
+            body.get("contract_version") == CONTRACT_V3_VERSION
+            or body.get("schema_version") == "runtime-foundation.generation-request.v3"
+        ):
+            return GenerationRequestV3.from_payload(body)
         if (
             body.get("contract_version") == CONTRACT_V2_VERSION
             or body.get("schema_version") == "runtime-foundation.generation-request.v2"
@@ -91,41 +97,85 @@ def create_app(core: RuntimeCore | None = None) -> FastAPI:
     async def foundation_error_handler(_: Request, exc: RuntimeFoundationError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.http_status,
-            content={"contract_version": CONTRACT_VERSION, "error": exc.as_dict()},
+            content={
+                "contract_version": CONTRACT_V3_VERSION
+                if _.url.path.startswith("/v3/")
+                else CONTRACT_VERSION,
+                "error": exc.as_dict(),
+            },
         )
 
     @app.get("/health")
     def health() -> dict[str, Any]:
         return runtime.health()
 
+    @app.get("/v3/health")
+    def health_v3() -> dict[str, Any]:
+        return runtime.health_v3()
+
     @app.get("/host")
     def host() -> dict[str, Any]:
         return runtime.host()
+
+    @app.get("/v3/host")
+    def host_v3() -> dict[str, Any]:
+        return runtime.host_v3()
 
     @app.get("/engines")
     def engines() -> dict[str, Any]:
         return {"contract_version": CONTRACT_VERSION, "engines": runtime.capabilities()}
 
+    @app.get("/v3/engines")
+    def engines_v3() -> dict[str, Any]:
+        return {"contract_version": "runtime-foundation.contract.v3", "engines": runtime.capabilities_v3()}
+
     @app.get("/engines/{engine}/capability")
     def capability(engine: str) -> dict[str, Any]:
         return runtime.capability(engine)
 
+    @app.get("/v3/engines/{engine}/capability")
+    def capability_v3(engine: str) -> dict[str, Any]:
+        return runtime.capability_v3(engine)
+
     @app.post("/models/load")
-    def load_model(body: dict[str, Any]) -> dict[str, Any]:
+    @app.post("/v3/models/load")
+    def load_model(body: dict[str, Any], request: Request) -> dict[str, Any]:
+        if request.url.path.startswith("/v3/") and body.get("load_options") is None:
+            body = {**body, "load_options": LoadOptions().to_dict()}
         artifact = _artifact_from_body(body)
         if isinstance(artifact, ExecutionInputV1):
-            return runtime.load(
+            result = runtime.load(
                 execution_input=artifact,
                 adapter=body.get("engine") or body.get("adapter"),
                 consumer_id=body.get("consumer_id"),
+                load_options=body.get("load_options"),
             )
-        return runtime.load(
-            artifact,
-            adapter=body.get("engine") or body.get("adapter"),
-            consumer_id=body.get("consumer_id"),
-        )
+        else:
+            result = runtime.load(
+                artifact,
+                adapter=body.get("engine") or body.get("adapter"),
+                consumer_id=body.get("consumer_id"),
+                load_options=body.get("load_options"),
+            )
+        if request.url.path.startswith("/v3/"):
+            resolution = result.get("raw", {}).get("load_options_resolution")
+            result["contract_version"] = CONTRACT_V3_VERSION
+            result["schema_version"] = "runtime-foundation.load-result.v3"
+            result["load_identity"] = result.get("raw", {}).get("load_identity")
+            result["load_options_evidence"] = (
+                {
+                    "requested": resolution.get("requested"),
+                    "resolved": resolution.get("resolved"),
+                    "effective": resolution.get("effective"),
+                    "resolutions": resolution.get("resolutions", []),
+                }
+                if resolution
+                else None
+            )
+        return result
 
     @app.post("/models/unload")
+    @app.post("/v3/models/unload")
     def unload_model(body: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = body or {}
         return runtime.unload(
@@ -136,12 +186,43 @@ def create_app(core: RuntimeCore | None = None) -> FastAPI:
 
     @app.post("/generate")
     def generate(body: dict[str, Any]) -> dict[str, Any]:
-        return runtime.generate(_generation_request(body)).to_dict()
+        request = _generation_request(body)
+        if isinstance(request, GenerationRequestV3):
+            return runtime.generate_v3(request).to_dict()
+        return runtime.generate(request).to_dict()
+
+    @app.post("/v3/generate")
+    def generate_v3(body: dict[str, Any]) -> dict[str, Any]:
+        request = _generation_request(body)
+        if not isinstance(request, GenerationRequestV3):
+            raise InvalidRequestError("/v3/generate requires a v3 GenerationRequest")
+        return runtime.generate_v3(request).to_dict()
 
     @app.post("/generate/stream")
     def generate_stream(body: dict[str, Any]) -> StreamingResponse:
         request = _generation_request(body)
+        if isinstance(request, GenerationRequestV3):
+            events = runtime.stream_v3(request)
+
+            def v3_lines():
+                for event in events:
+                    yield json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
+
+            return StreamingResponse(v3_lines(), media_type="application/x-ndjson")
         events = runtime.stream(request)
+
+        def lines():
+            for event in events:
+                yield json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
+
+        return StreamingResponse(lines(), media_type="application/x-ndjson")
+
+    @app.post("/v3/generate/stream")
+    def generate_stream_v3(body: dict[str, Any]) -> StreamingResponse:
+        request = _generation_request(body)
+        if not isinstance(request, GenerationRequestV3):
+            raise InvalidRequestError("/v3/generate/stream requires a v3 GenerationRequest")
+        events = runtime.stream_v3(request)
 
         def lines():
             for event in events:
@@ -153,6 +234,10 @@ def create_app(core: RuntimeCore | None = None) -> FastAPI:
     def cancel(request_id: str) -> dict[str, Any]:
         return runtime.cancel(request_id)
 
+    @app.post("/v3/requests/{request_id}/cancel")
+    def cancel_v3(request_id: str) -> dict[str, Any]:
+        return {**runtime.cancel(request_id), "contract_version": CONTRACT_V3_VERSION}
+
     @app.get("/runtime/metrics")
     def metrics() -> dict[str, Any]:
         return runtime.runtime_metrics()
@@ -160,6 +245,13 @@ def create_app(core: RuntimeCore | None = None) -> FastAPI:
     @app.get("/executions/{execution_id}")
     def execution(execution_id: str) -> dict[str, Any]:
         value = runtime.get_execution(execution_id)
+        if value is None:
+            raise InvalidRequestError("execution was not found", details={"execution_id": execution_id})
+        return value
+
+    @app.get("/v3/executions/{execution_id}")
+    def execution_v3(execution_id: str) -> dict[str, Any]:
+        value = runtime.get_execution_v3(execution_id)
         if value is None:
             raise InvalidRequestError("execution was not found", details={"execution_id": execution_id})
         return value

@@ -103,10 +103,14 @@ artifacts, resolves engine-neutral runtime settings, and records raw execution
 evidence. It does not own Benchmark/Novel/Learning policy, quality judgments,
 deployment eligibility, or task semantics.
 
-This release does not implement a second MLX runtime, a real llama.cpp runtime,
-LM Studio integration, generic artifact relocation, production deployment, or
-production performance conclusions. Windows and Mock results are development
-contract evidence, not production performance evidence. Real MLX production
-validation still requires the Mac runbook.
+At the v2 contract milestone, a real llama.cpp runtime was deferred. The
+additive v3 dual-runtime contract and llama.cpp adapter are now specified in
+[DUAL_RUNTIME_CONTRACT_V3.md](DUAL_RUNTIME_CONTRACT_V3.md) and
+[LLAMA_CPP_RUNTIME_DESIGN.md](LLAMA_CPP_RUNTIME_DESIGN.md); the v2 wire
+contract and fingerprints remain unchanged. LM Studio integration, generic
+artifact relocation, production deployment, and production performance
+conclusions remain outside this contract. Windows and Mock results are
+development contract evidence, not production performance evidence. Real
+engine production validation remains a separate Gate.
 
 Package version: `0.2.0`.

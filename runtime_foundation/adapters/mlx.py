@@ -19,6 +19,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from ..capabilities_v3 import (
+    CapabilityApplicabilityV3,
+    CapabilityDependency,
+    CapabilityScope,
+    CapabilityStatus,
+    EngineCapabilityV3,
+    OptionCapabilityV3,
+)
 from ..contracts import (
     EngineCapability,
     EngineIdentity,
@@ -46,9 +54,27 @@ from ..errors import (
     UnsupportedRuntimeOptionError,
     UnsupportedExecutionInputError,
 )
-from ..contracts_v2 import ADAPTER_LINEAGE_METADATA_KEY, AdapterLineageV1, BuildIdentityV1, ExecutionInputV1
+from ..contracts_v2 import (
+    ADAPTER_LINEAGE_METADATA_KEY,
+    AdapterLineageV1,
+    ArtifactBindingV2,
+    BuildIdentityV1,
+    EngineBindingV2,
+    ExecutionInputV1,
+    canonical_fingerprint,
+)
+from ..contracts_v3 import (
+    AccelerationConfiguration,
+    ExecutionConstraints,
+    GenerationOptions,
+    GenerationRequestV3,
+    LoadOptions,
+    LoadOptionsResolutionV1,
+    OptionResolutionV3,
+    SettingsEvidenceV3,
+)
 from ..host import runtime_snapshot
-from .base import EngineAdapter
+from .base import EngineAdapter, PreparedGenerationV3
 
 
 class MLXAdapter(EngineAdapter):
@@ -65,6 +91,7 @@ class MLXAdapter(EngineAdapter):
         self._stream_generate: Any = None
         self._active: dict[str, threading.Event] = {}
         self._last_metrics: dict[str, Any] = {}
+        self._selected_execution_acceleration: dict[str, Any] | None = None
 
     @staticmethod
     def _version(distribution: str) -> str | None:
@@ -96,6 +123,20 @@ class MLXAdapter(EngineAdapter):
         if mlx is None or mlx_lm is None:
             raise EngineUnavailableError("MLX/Metal adapter is unavailable on this host", details={"engine": self.name, "reason": reason})
         return mlx, mlx_lm
+
+    @staticmethod
+    def _execution_acceleration_observation(mlx: Any) -> dict[str, Any]:
+        default_device = getattr(mlx, "default_device", None)
+        device = str(default_device()) if callable(default_device) else None
+        metal_selected = bool(device and ("gpu" in device.lower() or "metal" in device.lower()))
+        return {
+            "engine": "mlx",
+            "status": "selected" if metal_selected else "unknown",
+            "backend": "metal" if metal_selected else "unknown",
+            "device": device,
+            "selection_evidence": "mlx.default_device() observed during model load" if device else None,
+            "actual_kernel_execution": "not_independently_observed",
+        }
 
     def _run_on_mlx_thread(self, function: Any) -> Any:
         """Run MLX stateful operations on the one thread that owns the loaded model."""
@@ -242,21 +283,610 @@ class MLXAdapter(EngineAdapter):
             build_identity=self.build_identity(),
         )
 
+    def _v3_applicability(
+        self,
+        *,
+        host_observation: dict[str, Any] | None,
+        artifact: ArtifactBindingV2 | None,
+        load_identity_fingerprint: str | None,
+    ) -> CapabilityApplicabilityV3:
+        engine = EngineBindingV2.from_legacy(
+            self.identity(), adapter_id=self.name, build_identity=self.build_identity()
+        )
+        return CapabilityApplicabilityV3(
+            depends_on=(
+                CapabilityDependency.ARTIFACT,
+                CapabilityDependency.ENGINE,
+                CapabilityDependency.ENGINE_BUILD,
+                CapabilityDependency.HOST,
+                CapabilityDependency.LOAD,
+            ),
+            artifact_identity=artifact.canonical_payload() if artifact is not None else None,
+            engine_identity={
+                "family": engine.family,
+                "implementation": engine.implementation.to_dict(),
+                "adapter_id": engine.adapter_id,
+            },
+            engine_build_identity=engine.build_identity.to_dict() if engine.build_identity else None,
+            host_fingerprint=canonical_fingerprint(host_observation) if host_observation is not None else None,
+            load_identity_fingerprint=load_identity_fingerprint,
+        )
+
+    def _thinking_template_status(self) -> tuple[CapabilityStatus, str, tuple[str, ...]]:
+        mlx, _, _ = self._modules()
+        if mlx is None:
+            return CapabilityStatus.UNAVAILABLE, "MLX is unavailable on this host", ()
+        with self._lock:
+            loaded = self._loaded is not None
+            tokenizer = self._tokenizer
+        if not loaded or tokenizer is None:
+            return CapabilityStatus.UNKNOWN, "Thinking applicability requires the loaded tokenizer template", ()
+        if not callable(getattr(tokenizer, "apply_chat_template", None)):
+            return CapabilityStatus.UNSUPPORTED, "loaded tokenizer does not expose apply_chat_template", ()
+        template = getattr(tokenizer, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default")
+        if not isinstance(template, str) or not template:
+            return CapabilityStatus.UNKNOWN, "loaded tokenizer did not expose a default chat-template source", ()
+        try:
+            from jinja2 import Environment, meta
+
+            variables = tuple(sorted(meta.find_undeclared_variables(Environment().parse(template))))
+        except Exception as exc:  # noqa: BLE001 - template syntax can require tokenizer-specific Jinja extensions
+            return CapabilityStatus.UNKNOWN, f"loaded chat-template variables could not be inspected: {type(exc).__name__}", ()
+        if "enable_thinking" in variables:
+            return CapabilityStatus.SUPPORTED, "loaded chat template references enable_thinking", variables
+        return CapabilityStatus.UNSUPPORTED, "loaded chat template has no enable_thinking control", variables
+
+    def _chat_template_status(self) -> tuple[CapabilityStatus, str]:
+        mlx, _, _ = self._modules()
+        if mlx is None:
+            return CapabilityStatus.UNAVAILABLE, "MLX is unavailable on this host"
+        with self._lock:
+            loaded = self._loaded is not None
+            tokenizer = self._tokenizer
+        if not loaded or tokenizer is None:
+            return CapabilityStatus.UNKNOWN, "chat-template applicability requires the loaded tokenizer"
+        if not callable(getattr(tokenizer, "apply_chat_template", None)):
+            return CapabilityStatus.UNSUPPORTED, "loaded tokenizer does not expose apply_chat_template"
+        template = getattr(tokenizer, "chat_template", None)
+        if isinstance(template, dict):
+            template = template.get("default")
+        if not isinstance(template, str) or not template:
+            return CapabilityStatus.UNKNOWN, "loaded tokenizer did not expose a default chat-template source"
+        return CapabilityStatus.SUPPORTED, "loaded tokenizer exposes a default chat template"
+
+    @staticmethod
+    def _mlx_v3_generation_api() -> dict[str, Any]:
+        try:
+            sample_utils = importlib.import_module("mlx_lm.sample_utils")
+            generate_module = importlib.import_module("mlx_lm.generate")
+        except (ImportError, ModuleNotFoundError):
+            return {}
+        sampler = getattr(sample_utils, "make_sampler", None)
+        logits_processors = getattr(sample_utils, "make_logits_processors", None)
+        generate_step = getattr(generate_module, "generate_step", None)
+        return {
+            "make_sampler": sampler if callable(sampler) else None,
+            "sampler_parameters": MLXAdapter._signature(sampler) if callable(sampler) else {},
+            "make_logits_processors": logits_processors if callable(logits_processors) else None,
+            "logits_parameters": MLXAdapter._signature(logits_processors) if callable(logits_processors) else {},
+            "generate_step_parameters": MLXAdapter._signature(generate_step) if callable(generate_step) else {},
+        }
+
+    def discover_capability_v3(
+        self,
+        *,
+        artifact: ArtifactBindingV2 | None = None,
+        host_observation: dict[str, Any] | None = None,
+        load_identity_fingerprint: str | None = None,
+    ) -> EngineCapabilityV3:
+        legacy_capability = super().discover_capability_v3(
+            artifact=artifact,
+            host_observation=host_observation,
+            load_identity_fingerprint=load_identity_fingerprint,
+        )
+        available = legacy_capability.status == CapabilityStatus.SUPPORTED
+        applicability = self._v3_applicability(
+            host_observation=host_observation,
+            artifact=artifact,
+            load_identity_fingerprint=load_identity_fingerprint,
+        )
+        unavailable = CapabilityStatus.UNAVAILABLE
+        unsupported = CapabilityStatus.UNSUPPORTED
+        supported = CapabilityStatus.SUPPORTED
+
+        def option(
+            status: CapabilityStatus,
+            scope: CapabilityScope,
+            reason: str,
+            *,
+            allowed: tuple[Any, ...] = (),
+            minimum: int | float | None = None,
+            maximum: int | float | None = None,
+            unit: str | None = None,
+            evidence: dict[str, Any] | None = None,
+        ) -> OptionCapabilityV3:
+            return OptionCapabilityV3(
+                status=status,
+                scope=scope,
+                requires_reload=scope == CapabilityScope.LOAD,
+                allowed_values=allowed,
+                minimum=minimum,
+                maximum=maximum,
+                unit=unit,
+                evidence=evidence or {},
+                reason=reason,
+                applicability=applicability,
+            )
+
+        unsupported_or_unavailable = unsupported if available else unavailable
+        status, thinking_reason, template_variables = self._thinking_template_status()
+        chat_template_status, chat_template_reason = self._chat_template_status()
+        generation_api = self._mlx_v3_generation_api()
+        sampler_parameters = generation_api.get("sampler_parameters", {})
+        logits_parameters = generation_api.get("logits_parameters", {})
+        generate_step_parameters = generation_api.get("generate_step_parameters", {})
+        top_k_status = (
+            supported
+            if available
+            and generation_api.get("make_sampler")
+            and "top_k" in sampler_parameters
+            and "sampler" in generate_step_parameters
+            else unsupported if available else unavailable
+        )
+        top_p_status = (
+            supported
+            if available
+            and generation_api.get("make_sampler")
+            and "top_p" in sampler_parameters
+            and "sampler" in generate_step_parameters
+            else unsupported if available else unavailable
+        )
+        repetition_status = (
+            supported
+            if available
+            and generation_api.get("make_logits_processors")
+            and {"repetition_penalty", "repetition_context_size"}.issubset(logits_parameters)
+            and "logits_processors" in generate_step_parameters
+            else unsupported if available else unavailable
+        )
+        option_values = dict(legacy_capability.options)
+        with self._lock:
+            tokenizer_for_vocab = self._tokenizer
+        vocab_size = getattr(tokenizer_for_vocab, "vocab_size", None)
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 2:
+            vocab_size = None
+        option_values.update(
+            {
+                "context.context_length": option(
+                    supported if available else unavailable,
+                    CapabilityScope.CONSTRAINT,
+                    "legacy context.context_length is a Foundation prompt-plus-generation budget",
+                    minimum=1,
+                    maximum=1_048_576,
+                    unit="tokens",
+                    evidence={"legacy_alias_for": "max_context_tokens"},
+                ),
+                "model_context_size": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "mlx-lm does not expose a controllable model/context allocation size at load",
+                    unit="tokens",
+                ),
+                "batch": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "mlx-lm model loading does not expose a batch-size setting",
+                    unit="tokens",
+                ),
+                "ubatch": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "mlx-lm model loading does not expose a physical batch-size setting",
+                    unit="tokens",
+                ),
+                "threads": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "MLX uses Metal device scheduling and exposes no load-time thread control",
+                    unit="threads",
+                ),
+                "kv_cache.key_type": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "mlx-lm does not expose KV key storage type as a model-load option",
+                ),
+                "kv_cache.value_type": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "mlx-lm does not expose KV value storage type as a model-load option",
+                ),
+                "acceleration.backend": option(
+                    supported if available else unavailable,
+                    CapabilityScope.LOAD,
+                    "MLX resolves its default device to Metal and has no CPU execution backend",
+                    allowed=("auto", "metal") if available else (),
+                    evidence={"default_device": "mlx.default_device()", "host": self._modules()[2]},
+                ),
+                "acceleration.device": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "mlx-lm selects the Metal device internally and exposes no stable device selector",
+                ),
+                "acceleration.gpu_offload_layers": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.LOAD,
+                    "MLX does not use llama.cpp layer-offload settings",
+                    unit="layers",
+                ),
+                "max_context_tokens": option(
+                    supported if available else unavailable,
+                    CapabilityScope.CONSTRAINT,
+                    "Foundation counts the loaded tokenizer's exact formatted prompt tokens before generation",
+                    minimum=1,
+                    maximum=1_048_576,
+                    unit="tokens",
+                    evidence={"requires_loaded_tokenizer": True, "preflight": "prompt_tokens + max_tokens"},
+                ),
+                "top_k": option(
+                    top_k_status,
+                    CapabilityScope.GENERATION,
+                    "mlx_lm.sample_utils.make_sampler top_k is passed through generate_step",
+                    minimum=0,
+                    maximum=vocab_size - 1 if vocab_size is not None else None,
+                    evidence={"sampler_parameter": "top_k", "vocabulary_size": vocab_size},
+                ),
+                "top_p": option(
+                    top_p_status,
+                    CapabilityScope.GENERATION,
+                    "mlx_lm.sample_utils.make_sampler top_p is passed through generate_step",
+                    minimum=0,
+                    maximum=1,
+                    evidence={"sampler_parameter": "top_p"},
+                ),
+                "repetition_penalty": option(
+                    repetition_status,
+                    CapabilityScope.GENERATION,
+                    "mlx_lm logits processor applies a request-scoped repetition penalty",
+                    minimum=0,
+                    evidence={"processor_parameter": "repetition_penalty", "exclusive_minimum": True},
+                ),
+                "repetition_window": option(
+                    repetition_status,
+                    CapabilityScope.GENERATION,
+                    "mlx_lm logits processor exposes a request-scoped repetition context size",
+                    minimum=1,
+                    maximum=1_048_576,
+                    unit="tokens",
+                    evidence={"processor_parameter": "repetition_context_size"},
+                ),
+                "stop": option(
+                    supported if available else unavailable,
+                    CapabilityScope.GENERATION,
+                    "Foundation trims requested stop strings at stream chunk boundaries and closes iteration cooperatively",
+                    evidence={"enforcement": "foundation-output-boundary", "termination": "cooperative"},
+                ),
+                "seed": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.GENERATION,
+                    "MLX stream_generate has no Foundation-isolated per-request seed mapping",
+                ),
+            }
+        )
+        # Replace the legacy, request-time thinking declaration with the
+        # artifact/load-applicable v3 observation.
+        thinking_option = option(
+            status,
+            CapabilityScope.GENERATION,
+            thinking_reason,
+            allowed=("OFF", "ON") if status == supported else (),
+            evidence={"chat_template_variables": list(template_variables)},
+        )
+        return replace(
+            legacy_capability,
+            options=option_values,
+            chat_template=option(
+                chat_template_status,
+                CapabilityScope.GENERATION,
+                chat_template_reason,
+                allowed=("tokenizer.apply_chat_template",) if chat_template_status == supported else (),
+                evidence={"chat_template_variables": list(template_variables)},
+            ),
+            thinking_supported=thinking_option,
+            thinking_effort_supported=option(
+                unsupported if available else unavailable,
+                CapabilityScope.GENERATION,
+                "MLX adapter maps only the boolean enable_thinking intent",
+            ),
+            thinking_budget_supported=option(
+                unsupported if available else unavailable,
+                CapabilityScope.GENERATION,
+                "MLX adapter does not expose a template or runtime thinking-token budget control",
+            ),
+        )
+
+    def resolve_load_options(self, artifact: ModelArtifactBinding, options: LoadOptions) -> LoadOptionsResolutionV1:
+        del artifact
+        self._available()
+        requested = LoadOptions.from_payload(options.to_dict())
+        unsupported_paths = [
+            path
+            for path, value in (
+                ("model_context_size", requested.model_context_size),
+                ("batch", requested.batch),
+                ("ubatch", requested.ubatch),
+                ("threads", requested.threads),
+                ("kv_cache.key_type", requested.kv_cache.key_type),
+                ("kv_cache.value_type", requested.kv_cache.value_type),
+                ("acceleration.device", requested.acceleration.device),
+                ("acceleration.gpu_offload_layers", requested.acceleration.gpu_offload_layers),
+            )
+            if value is not None
+        ]
+        if requested.acceleration.backend == "cpu":
+            unsupported_paths.append("acceleration.backend")
+        if unsupported_paths:
+            raise UnsupportedRuntimeOptionError(
+                "MLX cannot apply the requested v3 LoadOptions",
+                details={"engine": self.name, "unsupported_paths": sorted(unsupported_paths)},
+            )
+        effective = LoadOptions(
+            acceleration=AccelerationConfiguration(backend="metal"),
+        )
+        resolutions: tuple[OptionResolutionV3, ...] = ()
+        if requested.acceleration.backend != "metal":
+            resolutions = (
+                OptionResolutionV3(
+                    path="acceleration.backend",
+                    requested=requested.acceleration.backend,
+                    resolved="metal",
+                    effective="metal",
+                    status="resolved",
+                    reason="MLX default_device was observed as Metal during load-option validation",
+                ),
+            )
+        return LoadOptionsResolutionV1(
+            requested=requested,
+            resolved=effective,
+            effective=effective,
+            resolutions=resolutions,
+        )
+
+    def load_with_options(
+        self,
+        artifact: ModelArtifactBinding,
+        resolution: LoadOptionsResolutionV1,
+    ) -> dict[str, Any]:
+        expected = self.resolve_load_options(artifact, resolution.requested)
+        if (
+            resolution.resolved != expected.resolved
+            or resolution.effective != expected.effective
+            or resolution.resolutions != expected.resolutions
+        ):
+            raise UnsupportedRuntimeOptionError(
+                "MLX received LoadOptions evidence that does not match its validated resolution",
+                details={"artifact_id": artifact.artifact_id},
+            )
+        raw = self.load(artifact)
+        return {
+            **raw,
+            "effective_load_options": resolution.effective.to_dict(),
+            "observed_effective_load_state": dict(self._selected_execution_acceleration or {}),
+            "load_options_resolution": resolution.to_dict(),
+        }
+
+    def resolve_generation_options_v3(self, request: GenerationRequestV3) -> SettingsEvidenceV3:
+        options = request.generation_options
+        intent = options.thinking_intent
+        if intent.effort is not None or intent.budget_tokens is not None:
+            raise UnsupportedGenerationSettingError(
+                "MLX adapter supports only boolean Thinking Intent, not effort or token budget",
+                details={"engine": self.name, "requested": intent.to_dict()},
+            )
+        status, reason, _ = self._thinking_template_status()
+        if status != CapabilityStatus.SUPPORTED:
+            raise UnsupportedGenerationSettingError(
+                "the loaded MLX chat template cannot verifiably represent the requested Thinking Intent",
+                details={"engine": self.name, "requested": intent.to_dict(), "capability_status": status.value, "reason": reason},
+            )
+        api = self._mlx_v3_generation_api()
+        sampler = api.get("make_sampler")
+        sampler_parameters = api.get("sampler_parameters", {})
+        logits_processor_factory = api.get("make_logits_processors")
+        logits_parameters = api.get("logits_parameters", {})
+        generate_step_parameters = api.get("generate_step_parameters", {})
+
+        top_p_parameter = sampler_parameters.get("top_p")
+        if not callable(sampler) or top_p_parameter is None or top_p_parameter.default is inspect.Parameter.empty:
+            raise UnsupportedGenerationSettingError(
+                "the installed mlx-lm sampler does not expose an inspectable top_p default",
+                details={"engine": self.name, "option": "top_p"},
+            )
+        native_top_p_default = top_p_parameter.default
+        if (
+            isinstance(native_top_p_default, bool)
+            or not isinstance(native_top_p_default, (int, float))
+            or not 0 <= native_top_p_default <= 1
+        ):
+            raise EngineUnavailableError(
+                "the installed mlx-lm sampler exposed an invalid top_p default",
+                details={"engine": self.name, "default": native_top_p_default},
+            )
+        top_k_parameter = sampler_parameters.get("top_k")
+        if not callable(sampler) or top_k_parameter is None or top_k_parameter.default is inspect.Parameter.empty:
+            raise UnsupportedGenerationSettingError(
+                "the installed mlx-lm sampler does not expose an inspectable top_k default",
+                details={"engine": self.name, "option": "top_k"},
+            )
+        native_top_k_default = top_k_parameter.default
+        if (
+            isinstance(native_top_k_default, bool)
+            or not isinstance(native_top_k_default, int)
+            or native_top_k_default < 0
+        ):
+            raise EngineUnavailableError(
+                "the installed mlx-lm sampler exposed an invalid top_k default",
+                details={"engine": self.name, "default": native_top_k_default},
+            )
+        with self._lock:
+            tokenizer_for_vocab = self._tokenizer
+        vocab_size = getattr(tokenizer_for_vocab, "vocab_size", None)
+        if options.top_k is not None and isinstance(vocab_size, int) and not isinstance(vocab_size, bool):
+            if options.top_k >= vocab_size:
+                raise UnsupportedGenerationSettingError(
+                    "requested top_k must be smaller than the loaded MLX tokenizer vocabulary",
+                    details={"engine": self.name, "requested": options.top_k, "vocabulary_size": vocab_size},
+                )
+        if options.temperature == 0 and (
+            (options.top_p is not None and options.top_p > 0)
+            or (options.top_k is not None and options.top_k > 0)
+        ):
+            raise UnsupportedGenerationSettingError(
+                "mlx-lm greedy sampling ignores top_p and top_k when temperature is zero",
+                details={"engine": self.name, "temperature": 0, "options": [
+                    name
+                    for name, value in (("top_p", options.top_p), ("top_k", options.top_k))
+                    if value is not None and value > 0
+                ]},
+            )
+        if options.repetition_window is not None and options.repetition_penalty is None:
+            raise UnsupportedGenerationSettingError(
+                "repetition_window requires an explicit repetition_penalty",
+                details={"engine": self.name, "repetition_window": options.repetition_window},
+            )
+        effective_repetition_window = options.repetition_window
+        if options.repetition_penalty is not None:
+            if (
+                not callable(logits_processor_factory)
+                or not {"repetition_penalty", "repetition_context_size"}.issubset(logits_parameters)
+                or "logits_processors" not in generate_step_parameters
+            ):
+                raise UnsupportedGenerationSettingError(
+                    "the installed mlx-lm build cannot apply request-scoped repetition controls",
+                    details={"engine": self.name, "option": "repetition_penalty"},
+                )
+            window_parameter = logits_parameters["repetition_context_size"]
+            native_window_default = window_parameter.default
+            if window_parameter.default is inspect.Parameter.empty:
+                raise EngineUnavailableError(
+                    "the installed mlx-lm repetition processor has no inspectable context-size default",
+                    details={"engine": self.name, "option": "repetition_window"},
+                )
+            if effective_repetition_window is None:
+                if (
+                    isinstance(native_window_default, bool)
+                    or not isinstance(native_window_default, int)
+                    or native_window_default < 1
+                ):
+                    raise EngineUnavailableError(
+                        "the installed mlx-lm repetition processor exposed an invalid context-size default",
+                        details={"engine": self.name, "default": native_window_default},
+                    )
+                effective_repetition_window = native_window_default
+
+        effective_top_p = options.top_p if options.top_p is not None else float(native_top_p_default)
+        effective_top_k = options.top_k if options.top_k is not None else native_top_k_default
+        sanitized = replace(
+            options,
+            top_p=effective_top_p,
+            top_k=None,
+            repetition_penalty=None,
+            repetition_window=None,
+            stop=(),
+        )
+        base_evidence = super().resolve_generation_options_v3(
+            replace(request, generation_options=sanitized)
+        )
+        base_effective = GenerationOptions.from_payload(base_evidence.effective)
+        effective = GenerationOptions(
+            max_tokens=base_effective.max_tokens,
+            temperature=base_effective.temperature,
+            top_p=effective_top_p,
+            top_k=effective_top_k,
+            repetition_penalty=options.repetition_penalty,
+            repetition_window=effective_repetition_window,
+            stop=options.stop,
+            thinking_intent=base_effective.thinking_intent,
+        )
+        resolutions = list(base_evidence.resolutions)
+        if options.top_p is None:
+            resolutions.append(
+                OptionResolutionV3(
+                    path="top_p",
+                    requested=None,
+                    resolved=effective_top_p,
+                    effective=effective_top_p,
+                    status="resolved",
+                    reason="null resolves to the default exposed by the installed mlx_lm.sample_utils.make_sampler",
+                )
+            )
+        if options.top_k is None:
+            resolutions.append(
+                OptionResolutionV3(
+                    path="top_k",
+                    requested=None,
+                    resolved=effective_top_k,
+                    effective=effective_top_k,
+                    status="resolved",
+                    reason="null resolves to the default exposed by the installed mlx_lm.sample_utils.make_sampler",
+                )
+            )
+        if options.repetition_penalty is not None and options.repetition_window is None:
+            resolutions.append(
+                OptionResolutionV3(
+                    path="repetition_window",
+                    requested=None,
+                    resolved=effective_repetition_window,
+                    effective=effective_repetition_window,
+                    status="resolved",
+                    reason="null resolves to the installed mlx-lm repetition processor context-size default",
+                )
+            )
+        return SettingsEvidenceV3.from_options(
+            scope="GENERATION",
+            requested=options,
+            resolved=effective,
+            effective=effective,
+            resolutions=tuple(resolutions),
+        )
+
+    def count_prompt_tokens_v3(self, request: GenerationRequestV3) -> int | None:
+        options = GenerationOptions.from_payload(self.resolve_generation_options_v3(request).effective)
+        return self.prepare_generation_v3(request, options).prompt_tokens
+
+    def prepare_generation_v3(
+        self,
+        request: GenerationRequestV3,
+        effective_options: GenerationOptions,
+    ) -> PreparedGenerationV3:
+        legacy = self._legacy_v2_request(request, effective_options)
+        _, tokenizer, _ = self._ensure_loaded(legacy)
+        prompt = self._prompt(legacy, tokenizer)
+        token_ids = self._prompt_token_ids(tokenizer, prompt)
+        return PreparedGenerationV3(
+            prompt_tokens=len(token_ids),
+            adapter_state={"prompt": prompt, "prompt_token_ids": token_ids},
+        )
+
     def health(self) -> dict[str, Any]:
         capability = self.discover_capability()
         with self._lock:
             loaded = self._loaded
             active = list(self._active)
+            acceleration = dict(self._selected_execution_acceleration or {}) if loaded else None
         return {
             "status": "loaded" if loaded and capability.available else "ready" if capability.available else "unavailable",
             "engine": self.name,
             "loaded_artifact_id": loaded.artifact_id if loaded else None,
             "active_request_ids": active,
+            "selected_execution_acceleration": acceleration,
             "capability": capability.to_dict(),
         }
 
     def load(self, artifact: ModelArtifactBinding) -> dict[str, Any]:
-        _, mlx_lm = self._available()
+        mlx, mlx_lm = self._available()
+        acceleration = self._execution_acceleration_observation(mlx)
         path = Path(artifact.local_path)
         if not path.exists():
             raise ArtifactNotFoundError(
@@ -284,11 +914,13 @@ class MLXAdapter(EngineAdapter):
             self._stream_generate = getattr(mlx_lm, "stream_generate")
             self._loaded = artifact
             self._loaded_execution_input = None
+            self._selected_execution_acceleration = acceleration
         return {
             "loaded": True,
             "artifact_id": artifact.artifact_id,
             "load_duration_ms": (time.perf_counter() - started) * 1000,
             "measurement_provenance": "observed",
+            "selected_execution_acceleration": dict(self._selected_execution_acceleration or {}),
         }
 
     @staticmethod
@@ -508,7 +1140,8 @@ class MLXAdapter(EngineAdapter):
         self.validate_execution_input(execution_input)
         if not execution_input.adapters:
             return self.load(execution_input.base.to_legacy())
-        _, mlx_lm = self._available()
+        mlx, mlx_lm = self._available()
+        acceleration = self._execution_acceleration_observation(mlx)
         loader = getattr(mlx_lm, "load", None)
         if not callable(loader):
             raise EngineUnavailableError("installed mlx-lm does not expose load", details={"engine": self.name})
@@ -548,6 +1181,7 @@ class MLXAdapter(EngineAdapter):
             self._stream_generate = getattr(mlx_lm, "stream_generate")
             self._loaded = binding
             self._loaded_execution_input = execution_input
+            self._selected_execution_acceleration = acceleration
         return {
             "loaded": True,
             "artifact_id": binding.artifact_id,
@@ -557,6 +1191,7 @@ class MLXAdapter(EngineAdapter):
             "load_mode": "direct_base_plus_adapter",
             "load_duration_ms": (time.perf_counter() - started) * 1000,
             "measurement_provenance": "observed",
+            "selected_execution_acceleration": dict(self._selected_execution_acceleration or {}),
         }
 
     def resolve_runtime_options(self, options: RuntimeOptions) -> RuntimeSettingsResolution:
@@ -699,6 +1334,59 @@ class MLXAdapter(EngineAdapter):
         raise EngineRuntimeError("MLX tokenizer returned an unsupported chat-template value")
 
     @staticmethod
+    def _prompt_token_ids(tokenizer: Any, prompt: str) -> list[int]:
+        """Mirror mlx-lm's string-prompt BOS handling and return its actual input IDs."""
+
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            raise EngineUnavailableError(
+                "the loaded MLX tokenizer cannot encode the formatted prompt",
+                details={"engine": "mlx", "failure_kind": "tokenization_failure"},
+            )
+        bos_token = getattr(tokenizer, "bos_token", None)
+        add_special_tokens = bos_token is None or not prompt.startswith(str(bos_token))
+        try:
+            token_ids = encode(prompt, add_special_tokens=add_special_tokens)
+        except Exception as exc:  # noqa: BLE001 - exact-budget tokenization is a hard preflight boundary
+            raise EngineRuntimeError(
+                "MLX could not tokenize the formatted prompt with mlx-lm BOS semantics",
+                details={"engine": "mlx", "failure_kind": "tokenization_failure"},
+            ) from exc
+        if not isinstance(token_ids, (tuple, list)) or any(
+            isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in token_ids
+        ):
+            raise EngineRuntimeError(
+                "MLX tokenizer returned an invalid token sequence",
+                details={"engine": "mlx", "failure_kind": "tokenization_failure"},
+            )
+        if not token_ids:
+            raise EngineRuntimeError(
+                "MLX chat template produced an empty tokenized prompt",
+                details={"engine": "mlx", "failure_kind": "chat_template_failure"},
+            )
+        return list(token_ids)
+
+    @staticmethod
+    def _consume_stop_text(
+        buffered: str,
+        incoming: str,
+        stop_sequences: tuple[str, ...],
+    ) -> tuple[str, str, bool]:
+        """Return safe output, a possible stop-prefix suffix, and whether a stop matched."""
+
+        combined = buffered + incoming
+        matches = [(combined.find(stop), stop) for stop in stop_sequences if combined.find(stop) >= 0]
+        if matches:
+            match_index, _ = min(matches, key=lambda item: (item[0], -len(item[1]), item[1]))
+            return combined[:match_index], "", True
+        maximum_prefix = min(len(combined), max((len(stop) - 1 for stop in stop_sequences), default=0))
+        for length in range(maximum_prefix, 0, -1):
+            suffix = combined[-length:]
+            if any(stop.startswith(suffix) for stop in stop_sequences):
+                return combined[:-length], suffix, False
+        return combined, "", False
+
+    @staticmethod
     def _enforce_context_budget(request: GenerationRequest, prompt_tokens: int) -> None:
         context_length = request.runtime_options.context.context_length
         if context_length is None:
@@ -723,11 +1411,63 @@ class MLXAdapter(EngineAdapter):
             details={"timeout_ms": request.timeout_ms, "timeout_semantics": "cooperative"},
         )
 
-    def _stream_kwargs(self, request: GenerationRequest, options: RuntimeOptions, mlx_lm: Any) -> dict[str, Any]:
+    def _stream_kwargs(
+        self,
+        request: GenerationRequest,
+        options: RuntimeOptions,
+        mlx_lm: Any,
+        *,
+        v3_generation_options: GenerationOptions | None = None,
+    ) -> dict[str, Any]:
         stream_generate = getattr(mlx_lm, "stream_generate")
         parameters = self._signature(stream_generate)
         kwargs: dict[str, Any] = {"max_tokens": request.max_tokens}
-        if request.temperature != 0.0 or request.top_p not in {None, 1.0}:
+        if v3_generation_options is not None:
+            api = self._mlx_v3_generation_api()
+            make_sampler = api.get("make_sampler")
+            sampler_parameters = api.get("sampler_parameters", {})
+            if not callable(make_sampler) or "top_p" not in sampler_parameters:
+                raise UnsupportedGenerationSettingError(
+                    "the installed mlx-lm build cannot apply resolved v3 sampler options",
+                    details={"engine": self.name, "option": "sampler"},
+                )
+            sampler_kwargs: dict[str, Any] = {"top_p": v3_generation_options.top_p}
+            if v3_generation_options.top_k is not None:
+                if "top_k" not in sampler_parameters:
+                    raise UnsupportedGenerationSettingError(
+                        "the installed mlx-lm sampler does not expose top_k",
+                        details={"engine": self.name, "option": "top_k"},
+                    )
+                sampler_kwargs["top_k"] = v3_generation_options.top_k
+            try:
+                kwargs["sampler"] = make_sampler(v3_generation_options.temperature, **sampler_kwargs)
+            except (TypeError, ValueError) as exc:
+                raise UnsupportedGenerationSettingError(
+                    "installed mlx-lm could not construct the resolved v3 sampler",
+                    details={"engine": self.name, "settings": sampler_kwargs},
+                ) from exc
+            if v3_generation_options.repetition_penalty is not None:
+                make_logits_processors = api.get("make_logits_processors")
+                if not callable(make_logits_processors):
+                    raise UnsupportedGenerationSettingError(
+                        "the installed mlx-lm build has no repetition logits processor",
+                        details={"engine": self.name, "option": "repetition_penalty"},
+                    )
+                try:
+                    kwargs["logits_processors"] = make_logits_processors(
+                        repetition_penalty=v3_generation_options.repetition_penalty,
+                        repetition_context_size=v3_generation_options.repetition_window,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise UnsupportedGenerationSettingError(
+                        "installed mlx-lm could not construct the requested repetition processor",
+                        details={
+                            "engine": self.name,
+                            "repetition_penalty": v3_generation_options.repetition_penalty,
+                            "repetition_window": v3_generation_options.repetition_window,
+                        },
+                    ) from exc
+        if v3_generation_options is None and (request.temperature != 0.0 or request.top_p not in {None, 1.0}):
             try:
                 sample_utils = importlib.import_module("mlx_lm.sample_utils")
                 make_sampler = getattr(sample_utils, "make_sampler")
@@ -776,6 +1516,35 @@ class MLXAdapter(EngineAdapter):
         )
 
     def stream(self, request: GenerationRequest, cancel_event: threading.Event) -> Iterator[StreamEvent]:
+        yield from self._stream_common(request, cancel_event)
+
+    def stream_v3(
+        self,
+        request: GenerationRequestV3,
+        effective_options: GenerationOptions,
+        cancel_event: threading.Event,
+        prepared: PreparedGenerationV3 | None = None,
+    ) -> Iterator[StreamEvent]:
+        legacy = self._legacy_v2_request(request, effective_options)
+        yield from self._stream_common(
+            legacy,
+            cancel_event,
+            v3_constraints=request.execution_constraints,
+            v3_generation_options=effective_options,
+            prepared=prepared,
+            use_v3_token_ids=True,
+        )
+
+    def _stream_common(
+        self,
+        request: GenerationRequest,
+        cancel_event: threading.Event,
+        *,
+        v3_constraints: ExecutionConstraints | None = None,
+        v3_generation_options: GenerationOptions | None = None,
+        prepared: PreparedGenerationV3 | None = None,
+        use_v3_token_ids: bool = False,
+    ) -> Iterator[StreamEvent]:
         model, tokenizer, stream_generate = self._ensure_loaded(request)
         _, mlx_lm = self._available()
         with self._lock:
@@ -789,9 +1558,37 @@ class MLXAdapter(EngineAdapter):
                 context_length=request.runtime_options.context.context_length,
             )
             before = runtime_snapshot()
-            prompt = self._prompt(request, tokenizer)
-            prompt_tokens = max(1, len(getattr(tokenizer, "encode", lambda value: value.split())(prompt)))
-            self._enforce_context_budget(request, prompt_tokens)
+            if use_v3_token_ids:
+                state = prepared.adapter_state if prepared is not None else None
+                if not isinstance(state, dict) or not isinstance(state.get("prompt"), str) or not isinstance(
+                    state.get("prompt_token_ids"), list
+                ):
+                    raise EngineRuntimeError(
+                        "MLX v3 execution requires its prepared prompt token IDs",
+                        details={"engine": self.name, "failure_kind": "prepared_prompt_missing"},
+                    )
+                prompt = state["prompt"]
+                prompt_token_ids = state["prompt_token_ids"]
+                prompt_tokens = len(prompt_token_ids)
+                stream_prompt: str | list[int] = prompt_token_ids
+                max_context_tokens = v3_constraints.max_context_tokens if v3_constraints is not None else None
+                required_tokens = prompt_tokens + request.max_tokens
+                if max_context_tokens is not None and required_tokens > max_context_tokens:
+                    raise ContextLengthExceededError(
+                        "prompt plus requested generation exceeds max_context_tokens",
+                        details={
+                            "prompt_tokens": prompt_tokens,
+                            "max_tokens": request.max_tokens,
+                            "required_tokens": required_tokens,
+                            "max_context_tokens": max_context_tokens,
+                            "generation_started": False,
+                        },
+                    )
+            else:
+                prompt = self._prompt(request, tokenizer)
+                prompt_tokens = max(1, len(getattr(tokenizer, "encode", lambda value: value.split())(prompt)))
+                stream_prompt = prompt
+                self._enforce_context_budget(request, prompt_tokens)
         except Exception:
             # Preflight failures happen before the generation try/finally below.
             # Do not leave a request behind that can make cancel/unload appear busy.
@@ -806,9 +1603,22 @@ class MLXAdapter(EngineAdapter):
         try:
             yield StreamEvent(type="started", request_id=request.request_id, sequence=0)
             iterator_factory = lambda: stream_generate(
-                model, tokenizer, prompt, **self._stream_kwargs(request, request.runtime_options, mlx_lm)
+                model,
+                tokenizer,
+                stream_prompt,
+                **self._stream_kwargs(
+                    request,
+                    request.runtime_options,
+                    mlx_lm,
+                    v3_generation_options=v3_generation_options,
+                ),
             )
-            for sequence, item in enumerate(self._iter_on_mlx_thread(iterator_factory), start=1):
+            stop_sequences = v3_generation_options.stop if v3_generation_options is not None else ()
+            pending_stop_text = ""
+            matched_stop_sequence = False
+            sequence = 0
+            native_items = self._iter_on_mlx_thread(iterator_factory)
+            for sequence, item in enumerate(native_items, start=1):
                 if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
                     metrics.timeout = True
                     metrics.finished_at = utc_now()
@@ -840,10 +1650,28 @@ class MLXAdapter(EngineAdapter):
                 if not isinstance(delta, str):
                     delta = str(delta or "")
                 if delta:
-                    if not text_parts:
+                    if stop_sequences:
+                        delta, pending_stop_text, matched_stop_sequence = self._consume_stop_text(
+                            pending_stop_text,
+                            delta,
+                            stop_sequences,
+                        )
+                    if delta and not text_parts:
                         metrics.cold_ttft_ms = (time.perf_counter() - started_monotonic) * 1000
-                    text_parts.append(delta)
-                    yield StreamEvent(type="delta", request_id=request.request_id, sequence=sequence, delta=delta)
+                    if delta:
+                        text_parts.append(delta)
+                        yield StreamEvent(type="delta", request_id=request.request_id, sequence=sequence, delta=delta)
+                    if matched_stop_sequence:
+                        native_items.close()
+                        break
+            if pending_stop_text and not matched_stop_sequence:
+                text_parts.append(pending_stop_text)
+                yield StreamEvent(
+                    type="delta",
+                    request_id=request.request_id,
+                    sequence=sequence + 1,
+                    delta=pending_stop_text,
+                )
             if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
                 metrics.timeout = True
                 metrics.finished_at = utc_now()
@@ -881,7 +1709,11 @@ class MLXAdapter(EngineAdapter):
             metrics.swap_after_bytes = after.get("swap_used_bytes")
             if isinstance(metrics.swap_before_bytes, int) and isinstance(metrics.swap_after_bytes, int):
                 metrics.swap_delta_bytes = metrics.swap_after_bytes - metrics.swap_before_bytes
-            metrics.finish_reason = self._item_value(last_item, "finish_reason", "stop") or "stop"
+            metrics.finish_reason = (
+                "stop_sequence"
+                if matched_stop_sequence
+                else self._item_value(last_item, "finish_reason", "stop") or "stop"
+            )
             result = GenerationResult(
                 request_id=request.request_id,
                 model_artifact_id=request.model_artifact_id,
@@ -937,6 +1769,33 @@ class MLXAdapter(EngineAdapter):
             raise EngineRuntimeError("MLX generation ended without a result")
         return self._result_from_payload(completed)
 
+    def generate_v3(
+        self,
+        request: GenerationRequestV3,
+        effective_options: GenerationOptions,
+        cancel_event: threading.Event,
+        prepared: PreparedGenerationV3 | None = None,
+    ) -> GenerationResult:
+        completed: dict[str, Any] | None = None
+        for event in self.stream_v3(request, effective_options, cancel_event, prepared=prepared):
+            if event.type == "completed":
+                completed = event.result
+            elif event.type == "error":
+                error = event.error or {}
+                details = dict(error.get("details") or {})
+                if error.get("code") == "cancelled":
+                    raise RequestCancelledError(str(error.get("message") or "generation was cancelled"), details=details)
+                if error.get("code") == "runtime_timeout":
+                    raise RuntimeTimeoutError(str(error.get("message") or "generation timed out"), details=details)
+                if error.get("code") == "context_length_exceeded":
+                    raise ContextLengthExceededError(
+                        str(error.get("message") or "context budget exceeded"), details=details
+                    )
+                raise EngineRuntimeError(str(error.get("message") or "MLX generation failed"), details=details)
+        if completed is None:
+            raise EngineRuntimeError("MLX generation ended without a result")
+        return self._result_from_payload(completed)
+
     def cancel(self, request_id: str) -> bool:
         with self._lock:
             event = self._active.get(request_id)
@@ -955,6 +1814,7 @@ class MLXAdapter(EngineAdapter):
             self._model = None
             self._tokenizer = None
             self._stream_generate = None
+            self._selected_execution_acceleration = None
         started = time.perf_counter()
         try:
             mlx, _, _ = self._modules()

@@ -75,6 +75,15 @@ with LocalRuntimeClient() as runtime:
 before sending it to the loopback service; v1 request and artifact objects
 remain supported.
 
+Contract v3 uses its own separated option objects and versioned routes; it does
+not reinterpret a v1/v2 object automatically. Pass `LoadOptions` to
+`LocalRuntimeClient.load()` to select `/v3/models/load`. Pass a
+`GenerationRequestV3` containing one `GenerationOptions` and one
+`ExecutionConstraints` to `generate()` or `stream()` to select the v3 route.
+Results include v3 Execution Evidence with requested, resolved, and effective
+values for Load, Generation, and Constraints. See
+[DUAL_RUNTIME_CONTRACT_V3.md](DUAL_RUNTIME_CONTRACT_V3.md).
+
 For Base + Adapter Direct, pass `execution_input` to load and include the same
 input in Generation Request v2. Foundation checks content identity and
 compatibility before loading and rejects a generation composition mismatch.
@@ -109,6 +118,12 @@ Learning may use the Foundation client to check inference behavior of a learned 
 | `POST /requests/{id}/cancel` | Cancellation request. |
 | `GET /runtime/metrics` | Raw runtime/service metrics. |
 | `GET /executions/{id}` | In-memory execution trace for diagnostics. |
+| `GET /v3/host` | Separate host, MLX, llama.cpp-build, and selected-acceleration observations. |
+| `GET /v3/engines/{engine}/capability` | V3 option-level engine capability. |
+| `POST /v3/models/load` | Load with explicit v3 `LoadOptions`. |
+| `POST /v3/generate` | Generation with v3 `GenerationOptions` and `ExecutionConstraints`. |
+| `POST /v3/generate/stream` | V3 streaming generation with execution evidence. |
+| `GET /v3/executions/{id}` | In-memory v3 execution trace. |
 
 ## No automatic acquisition
 

@@ -4,7 +4,7 @@
 - Version: `1.0`
 - Status: **Canonical / Current**
 - Foundation version: `0.2.0`
-- Contract versions: `runtime-foundation.contract.v1` and additive `runtime-foundation.contract.v2`
+- Contract versions: `runtime-foundation.contract.v1`, `.v2`, and additive `.v3`
 - Development host: Windows
 - Production validation host: Apple Silicon Mac
 
@@ -40,12 +40,21 @@ Consumer Studio
         └── Engine Adapter interface
                 ├── Mock Adapter
                 ├── MLX Adapter
-                └── llama.cpp / GGUF skeleton
+                └── llama.cpp Adapter (GGUF)
 ```
 
 The selected boundary is `package + optional service facade`, with the service as the normal multi-consumer path. A shared Python package alone cannot safely own one model allocation across three independent processes. A distributed architecture is unnecessary for v1.
 
-When a load request omits an engine, the Core resolves the artifact format to its real engine (`mlx`/`safetensors` to MLX and `gguf` to llama.cpp). An unavailable mapped engine is an error; Mock is never a generic fallback and is usable only when explicitly requested. The unauthenticated service is loopback-only in v1.
+MLX and `llama.cpp` are first-class Execution Engines; MLX/safetensors and
+GGUF are Artifact Formats. When a load request omits an engine, Foundation
+selects the format's default (`mlx`/`safetensors` → MLX, `gguf` → llama.cpp).
+Explicit engine selection is validated separately against the adapter's
+format capability. An unavailable mapped engine is an error; Mock is never a
+generic fallback and is usable only when explicitly requested. GGML is outside
+the new GGUF execution contract. V3 option and evidence semantics are specified
+in [DUAL_RUNTIME_CONTRACT_V3.md](DUAL_RUNTIME_CONTRACT_V3.md); the optional
+llama.cpp binding and its same-process failure guarantees are specified in
+[LLAMA_CPP_RUNTIME_DESIGN.md](LLAMA_CPP_RUNTIME_DESIGN.md).
 
 | Option | Decision | Reason |
 | --- | --- | --- |
