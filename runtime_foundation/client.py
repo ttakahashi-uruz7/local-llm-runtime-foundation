@@ -10,6 +10,7 @@ import httpx
 
 from .contracts import GenerationRequest, ModelArtifactBinding
 from .contracts_v2 import ArtifactBindingV2, ExecutionInputV1, GenerationRequestV2
+from .contracts_v3 import CONTRACT_V3_VERSION, GenerationRequestV3, LoadOptions
 from .network import validate_loopback_url
 
 
@@ -72,14 +73,26 @@ class LocalRuntimeClient:
     def health(self) -> dict[str, Any]:
         return self._decode(self._client.get("/health"))
 
+    def health_v3(self) -> dict[str, Any]:
+        return self._decode(self._client.get("/v3/health"))
+
     def host(self) -> dict[str, Any]:
         return self._decode(self._client.get("/host"))
+
+    def host_v3(self) -> dict[str, Any]:
+        return self._decode(self._client.get("/v3/host"))
 
     def engines(self) -> dict[str, Any]:
         return self._decode(self._client.get("/engines"))
 
+    def engines_v3(self) -> dict[str, Any]:
+        return self._decode(self._client.get("/v3/engines"))
+
     def capability(self, engine: str) -> dict[str, Any]:
         return self._decode(self._client.get(f"/engines/{engine}/capability"))
+
+    def capability_v3(self, engine: str) -> dict[str, Any]:
+        return self._decode(self._client.get(f"/v3/engines/{engine}/capability"))
 
     def load(
         self,
@@ -88,6 +101,7 @@ class LocalRuntimeClient:
         execution_input: ExecutionInputV1 | dict[str, Any] | None = None,
         engine: str | None = None,
         consumer_id: str | None = None,
+        load_options: LoadOptions | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if artifact is not None and execution_input is not None:
             raise ValueError("provide either artifact or execution_input, not both")
@@ -105,7 +119,10 @@ class LocalRuntimeClient:
             body["engine"] = engine
         if consumer_id is not None:
             body["consumer_id"] = consumer_id
-        return self._decode(self._client.post("/models/load", json=body))
+        if load_options is not None:
+            body["load_options"] = load_options.to_dict() if isinstance(load_options, LoadOptions) else load_options
+        path = "/v3/models/load" if load_options is not None else "/models/load"
+        return self._decode(self._client.post(path, json=body))
 
     def unload(
         self, artifact_id: str | None = None, *, consumer_id: str | None = None, lease_id: str | None = None
@@ -119,13 +136,24 @@ class LocalRuntimeClient:
             body["lease_id"] = lease_id
         return self._decode(self._client.post("/models/unload", json=body))
 
-    def generate(self, request: GenerationRequest | GenerationRequestV2 | dict[str, Any]) -> dict[str, Any]:
-        payload = request.to_dict() if isinstance(request, GenerationRequest) else request
-        return self._decode(self._client.post("/generate", json=payload))
+    def generate(
+        self, request: GenerationRequest | GenerationRequestV2 | GenerationRequestV3 | dict[str, Any]
+    ) -> dict[str, Any]:
+        payload = request.to_dict() if isinstance(request, (GenerationRequest, GenerationRequestV2, GenerationRequestV3)) else request
+        is_v3 = isinstance(request, GenerationRequestV3) or (
+            isinstance(payload, dict) and payload.get("contract_version") == CONTRACT_V3_VERSION
+        )
+        return self._decode(self._client.post("/v3/generate" if is_v3 else "/generate", json=payload))
 
-    def stream(self, request: GenerationRequest | GenerationRequestV2 | dict[str, Any]) -> Iterator[dict[str, Any]]:
-        payload = request.to_dict() if isinstance(request, GenerationRequest) else request
-        with self._client.stream("POST", "/generate/stream", json=payload) as response:
+    def stream(
+        self, request: GenerationRequest | GenerationRequestV2 | GenerationRequestV3 | dict[str, Any]
+    ) -> Iterator[dict[str, Any]]:
+        payload = request.to_dict() if isinstance(request, (GenerationRequest, GenerationRequestV2, GenerationRequestV3)) else request
+        is_v3 = isinstance(request, GenerationRequestV3) or (
+            isinstance(payload, dict) and payload.get("contract_version") == CONTRACT_V3_VERSION
+        )
+        path = "/v3/generate/stream" if is_v3 else "/generate/stream"
+        with self._client.stream("POST", path, json=payload) as response:
             if response.status_code >= 400:
                 raise RemoteRuntimeError(response.status_code, response.json())
             for line in response.iter_lines():
@@ -136,8 +164,14 @@ class LocalRuntimeClient:
     def cancel(self, request_id: str) -> dict[str, Any]:
         return self._decode(self._client.post(f"/requests/{request_id}/cancel"))
 
+    def cancel_v3(self, request_id: str) -> dict[str, Any]:
+        return self._decode(self._client.post(f"/v3/requests/{request_id}/cancel"))
+
     def runtime_metrics(self) -> dict[str, Any]:
         return self._decode(self._client.get("/runtime/metrics"))
 
     def execution(self, execution_id: str) -> dict[str, Any]:
         return self._decode(self._client.get(f"/executions/{execution_id}"))
+
+    def execution_v3(self, execution_id: str) -> dict[str, Any]:
+        return self._decode(self._client.get(f"/v3/executions/{execution_id}"))

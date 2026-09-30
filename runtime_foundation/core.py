@@ -7,11 +7,14 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, cast
 
 from .adapters import EngineAdapter, LlamaCppAdapter, MLXAdapter, MockAdapter
+from .adapters.base import PreparedGenerationV3
 from .contracts import (
     CONTRACT_VERSION,
+    EngineCapability,
+    EngineIdentity,
     ExecutionTrace,
     GenerationRequest,
     GenerationResult,
@@ -34,6 +37,8 @@ from .contracts_v2 import (
     ExecutionInputV1,
     ExecutionGuardVerification,
     ExecutionTraceV2,
+    EngineBindingV2,
+    FoundationBindingV2,
     GenerationRequestV2,
     GenerationResultV2,
     ThinkingIntent,
@@ -42,10 +47,29 @@ from .contracts_v2 import (
     build_execution_binding,
     is_valid_fingerprint,
 )
+from .contracts_v3 import (
+    CONTRACT_V3_VERSION,
+    SUPPORTED_CONTRACT_VERSIONS_V3,
+    ExecutionBindingV3,
+    ExecutionEvidenceV3,
+    ExecutionOptionsEvidenceV3,
+    ExecutionTraceV3,
+    GenerationOptions,
+    GenerationRequestV3,
+    GenerationResultV3,
+    LoadIdentityV1,
+    LoadOptions,
+    LoadOptionsResolutionV1,
+    OptionResolutionV3,
+    SettingsEvidenceV3,
+    StreamEventV3,
+)
 from .build_identity import observe_foundation_build_identity
+from .capabilities_v3 import EngineCapabilityV3, HostExecutionCapabilitiesV3
 from .errors import (
     ArtifactCompatibilityError,
     ArtifactNotFoundError,
+    ContextLengthExceededError,
     EngineNotFoundError,
     EngineRuntimeError,
     EngineUnavailableError,
@@ -64,7 +88,9 @@ from .errors import (
     UnsupportedGenerationSettingError,
     error_payload,
 )
-from .host import HostProfile
+from .engines import default_engine_for_artifact_format, engine_wire_identifier, normalize_engine_identifier
+from .host import HostProfile, host_metal_capability
+from .gguf import VerifiedGGUFArtifact
 from .version import FOUNDATION_VERSION
 
 DEFAULT_CONSUMER_ID = "anonymous"
@@ -92,12 +118,6 @@ class _ActiveRequest:
 class RuntimeCore:
     """Own one loaded model process and expose engine-neutral operations."""
 
-    _ARTIFACT_ENGINE_MAP: ClassVar[dict[str, str]] = {
-        "mlx": "mlx",
-        "safetensors": "mlx",
-        "gguf": "llama.cpp",
-    }
-
     def __init__(
         self,
         *,
@@ -116,20 +136,30 @@ class RuntimeCore:
         else:
             raise ValueError("foundation_build_identity must be a validated BuildIdentityV1 or payload")
         self.host_profile = host_profile or HostProfile.detect()
-        self.adapters: dict[str, EngineAdapter] = adapters or {
+        adapter_source: dict[str, EngineAdapter] = adapters or {
             "mock": MockAdapter(),
             "mlx": MLXAdapter(),
-            "llama.cpp": LlamaCppAdapter(),
+            "llama.cpp": LlamaCppAdapter(host_profile=self.host_profile),
         }
+        self.adapters = {}
+        for identifier, adapter in adapter_source.items():
+            canonical = normalize_engine_identifier(identifier)
+            if canonical in self.adapters:
+                raise ValueError(f"multiple adapters resolve to the same engine identifier: {canonical}")
+            self.adapters[canonical] = adapter
         self._lock = threading.RLock()
         self._state = LifecycleState.UNLOADED
         self._loaded_artifact: ModelArtifactBinding | None = None
         self._loaded_artifact_v2: ArtifactBindingV2 | None = None
         self._loaded_execution_input: ExecutionInputV1 | None = None
+        self._loaded_load_options: LoadOptions | None = None
+        self._loaded_load_options_resolution: LoadOptionsResolutionV1 | None = None
+        self._loaded_load_identity: LoadIdentityV1 | None = None
         self._loaded_adapter: EngineAdapter | None = None
         self._leases: dict[str, str] = {}
         self._active: dict[str, _ActiveRequest] = {}
         self._traces: dict[str, ExecutionTrace] = {}
+        self._v3_traces: dict[str, ExecutionTraceV3] = {}
         self._last_error: dict[str, Any] | None = None
         self._last_load_duration_ms: float | None = None
         self._last_unload_duration_ms: float | None = None
@@ -168,7 +198,7 @@ class RuntimeCore:
         return v2, v2.to_legacy()
 
     def _select_adapter(self, artifact: ModelArtifactBinding, requested: str | None) -> EngineAdapter:
-        engine_name = requested.strip() if isinstance(requested, str) and requested.strip() else None
+        engine_name = normalize_engine_identifier(requested) if isinstance(requested, str) and requested.strip() else None
         if engine_name:
             try:
                 selected = self.adapters[engine_name]
@@ -177,12 +207,13 @@ class RuntimeCore:
                     "requested engine is not registered", details={"engine": engine_name}
                 ) from exc
         else:
-            engine_name = self._ARTIFACT_ENGINE_MAP.get(artifact.format)
-            if engine_name is None:
+            family = default_engine_for_artifact_format(artifact.format)
+            if family is None:
                 raise EngineNotFoundError(
                     "no engine is registered for the artifact format; specify a supported engine explicitly",
                     details={"format": artifact.format, "artifact_id": artifact.artifact_id},
                 )
+            engine_name = engine_wire_identifier(family)
             try:
                 selected = self.adapters[engine_name]
             except KeyError as exc:
@@ -201,10 +232,32 @@ class RuntimeCore:
                     "reason": capability.reason,
                 },
             )
+        supported_formats = {
+            item.strip().lower()
+            for item in capability.artifact_formats
+            if isinstance(item, str) and item.strip()
+        }
+        if artifact.format.strip().lower() not in supported_formats:
+            raise ArtifactCompatibilityError(
+                "the selected engine does not declare compatibility with the artifact format",
+                details={
+                    "engine": selected.name,
+                    "format": artifact.format,
+                    "supported_formats": sorted(supported_formats),
+                    "compatibility_status": "unsupported",
+                },
+            )
         return selected
 
     def capabilities(self) -> list[dict[str, Any]]:
         return [self.adapters[name].discover_capability().to_dict() for name in sorted(self.adapters)]
+
+    def capabilities_v3(self) -> list[dict[str, Any]]:
+        host_observation = self.host_profile.to_dict()
+        return [
+            self.adapters[name].discover_capability_v3(host_observation=host_observation).to_dict()
+            for name in sorted(self.adapters)
+        ]
 
     def capability(self, engine: str) -> dict[str, Any]:
         try:
@@ -213,8 +266,65 @@ class RuntimeCore:
             raise EngineNotFoundError("requested engine is not registered", details={"engine": engine}) from exc
         return adapter.discover_capability().to_dict()
 
+    def capability_v3(self, engine: str) -> dict[str, Any]:
+        normalized = normalize_engine_identifier(engine)
+        try:
+            adapter = self.adapters[normalized]
+        except KeyError as exc:
+            raise EngineNotFoundError("requested engine is not registered", details={"engine": normalized}) from exc
+        return adapter.discover_capability_v3(host_observation=self.host_profile.to_dict()).to_dict()
+
     def host(self) -> dict[str, Any]:
         return self.host_profile.to_dict()
+
+    def host_v3(self) -> dict[str, Any]:
+        host_metal, host_metal_reason = host_metal_capability(self.host_profile.platform)
+        llama_adapter = self.adapters.get("llama.cpp")
+        if llama_adapter is None:
+            llama_capability = EngineCapabilityV3.from_legacy(
+                EngineCapability(
+                    identity=EngineIdentity("llama.cpp"),
+                    available=False,
+                    streaming=False,
+                    cancellation=False,
+                    load_unload=False,
+                    reason="llama.cpp adapter is not registered",
+                ),
+                engine_binding=EngineBindingV2.from_legacy(EngineIdentity("llama.cpp"), adapter_id="llama.cpp"),
+            )
+        else:
+            llama_capability = llama_adapter.discover_capability_v3(
+                host_observation={
+                    **self.host_profile.to_dict(),
+                    "host_metal_capability": host_metal,
+                    "host_metal_reason": host_metal_reason,
+                }
+            )
+        selected_acceleration: dict[str, Any] | None = None
+        with self._lock:
+            loaded_adapter = self._loaded_adapter
+        if loaded_adapter is not None:
+            try:
+                observed = loaded_adapter.health().get("selected_execution_acceleration")
+            except Exception:  # noqa: BLE001 - host diagnostics must not mask runtime health
+                observed = None
+            selected_acceleration = observed or {"engine": loaded_adapter.name, "status": "unknown"}
+        execution_capabilities = HostExecutionCapabilitiesV3.observe(
+            platform=self.host_profile.platform,
+            architecture=self.host_profile.architecture,
+            host_metal=host_metal,
+            host_metal_reason=host_metal_reason,
+            mlx_available=self.host_profile.mlx_available,
+            mlx_default_device_metal=self.host_profile.metal_available,
+            llama_cpp_capability=llama_capability,
+            selected_execution_acceleration=selected_acceleration,
+        )
+        return {
+            "contract_version": CONTRACT_V3_VERSION,
+            "supported_contract_versions": list(SUPPORTED_CONTRACT_VERSIONS_V3),
+            "host": self.host_profile.to_dict(),
+            "execution_capabilities": execution_capabilities.to_dict(),
+        }
 
     def load(
         self,
@@ -223,12 +333,25 @@ class RuntimeCore:
         execution_input: ExecutionInputV1 | dict[str, Any] | None = None,
         adapter: str | None = None,
         consumer_id: str | None = None,
+        load_options: LoadOptions | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if artifact is not None and execution_input is not None:
             raise InvalidRequestError("provide either artifact or execution_input, not both")
         candidate = execution_input if execution_input is not None else artifact
         if candidate is None:
             raise InvalidRequestError("artifact or execution_input is required")
+        options_were_explicit = load_options is not None
+        if isinstance(load_options, LoadOptions):
+            requested_load_options = LoadOptions.from_payload(load_options.to_dict())
+        elif isinstance(load_options, dict):
+            try:
+                requested_load_options = LoadOptions.from_payload(load_options)
+            except ValueError as exc:
+                raise InvalidRequestError(str(exc)) from exc
+        elif load_options is None:
+            requested_load_options = LoadOptions()
+        else:
+            raise InvalidRequestError("load_options must be a validated LoadOptions or object payload")
         direct_input: ExecutionInputV1 | None
         if isinstance(candidate, ExecutionInputV1):
             direct_input = ExecutionInputV1.from_payload(candidate.to_dict())
@@ -276,6 +399,58 @@ class RuntimeCore:
                             "actual_content_identity": actual_identity.to_dict(),
                         },
                     )
+        verified_gguf: VerifiedGGUFArtifact | None = None
+        gguf_observation: dict[str, Any] | None = None
+        if (binding.format or "").lower() == "gguf":
+            try:
+                verified_gguf = VerifiedGGUFArtifact.open(artifact_v2)
+                gguf_observation = verified_gguf.observed.to_dict()
+            except RuntimeFoundationError:
+                raise
+            except (OSError, ValueError) as exc:
+                raise ArtifactCompatibilityError(
+                    "GGUF artifact could not be validated",
+                    details={"artifact_id": binding.artifact_id, "reason": str(exc)},
+                ) from exc
+            if direct_input is None:
+                # The existing v2 ArtifactBinding remains the one identity
+                # system. For GGUF, Core enriches it with observed content and
+                # quantization before selection, load reuse, and evidence.
+                artifact_v2 = replace(
+                    artifact_v2,
+                    content_identity=verified_gguf.observed.content_identity,
+                    format="gguf",
+                    quantization=verified_gguf.observed.quantization,
+                )
+                binding = artifact_v2.to_legacy()
+        try:
+            return self._load_validated(
+                artifact_v2=artifact_v2,
+                binding=binding,
+                direct_input=direct_input,
+                options_were_explicit=options_were_explicit,
+                requested_load_options=requested_load_options,
+                verified_gguf=verified_gguf,
+                consumer_id=consumer_id,
+                adapter=adapter,
+            )
+        finally:
+            if verified_gguf is not None:
+                verified_gguf.close()
+
+    def _load_validated(
+        self,
+        *,
+        artifact_v2: ArtifactBindingV2,
+        binding: ModelArtifactBinding,
+        direct_input: ExecutionInputV1 | None,
+        options_were_explicit: bool,
+        requested_load_options: LoadOptions,
+        verified_gguf: VerifiedGGUFArtifact | None,
+        consumer_id: str | None,
+        adapter: str | None,
+    ) -> dict[str, Any]:
+        gguf_observation = verified_gguf.observed.to_dict() if verified_gguf is not None else None
         owner = self._consumer_id(consumer_id)
         selected: EngineAdapter
         try:
@@ -286,6 +461,29 @@ class RuntimeCore:
                 self._last_error = exc.as_dict()
             raise
         assert selected is not None
+        if verified_gguf is not None:
+            load_options_resolution = selected.resolve_load_options_with_observation(
+                binding,
+                requested_load_options,
+                verified_gguf.observed,
+            )
+        else:
+            load_options_resolution = selected.resolve_load_options(binding, requested_load_options)
+        if not isinstance(load_options_resolution, LoadOptionsResolutionV1):
+            raise EngineRuntimeError(
+                "engine adapter returned an invalid LoadOptions resolution",
+                details={"engine": selected.name},
+            )
+        engine_binding = EngineBindingV2.from_legacy(
+            selected.identity(),
+            adapter_id=selected.name,
+            build_identity=selected.build_identity(),
+        )
+        requested_load_identity = LoadIdentityV1.create(
+            artifact=artifact_v2,
+            engine=engine_binding,
+            effective_load_options=load_options_resolution.effective,
+        )
         with self._lock:
             loaded_adapter = self._loaded_adapter
             if self._loaded_artifact is not None and loaded_adapter is not None:
@@ -295,12 +493,26 @@ class RuntimeCore:
                     if same_direct_mode and direct_input is not None and self._loaded_execution_input is not None
                     else same_direct_mode and self._loaded_artifact.execution_identity() == binding.execution_identity()
                 )
-                if same_binding and loaded_adapter is selected:
+                if (
+                    same_binding
+                    and loaded_adapter is selected
+                    and self._loaded_load_identity is not None
+                    and self._loaded_load_identity.fingerprint == requested_load_identity.fingerprint
+                ):
                     lease_id = self._leases.setdefault(owner, new_id("lease"))
                     raw = {
                         "loaded_once": True,
                         "loaded_artifact_identity": self._loaded_artifact.execution_identity(),
                     }
+                    if gguf_observation is not None:
+                        raw["gguf_validation"] = gguf_observation
+                    if options_were_explicit:
+                        raw.update(
+                            {
+                                "load_identity": self._loaded_load_identity.to_dict(),
+                                "load_options_resolution": load_options_resolution.to_dict(),
+                            }
+                        )
                     if self._loaded_execution_input is not None:
                         raw.update({
                             "execution_input": self._loaded_execution_input.to_dict(),
@@ -317,13 +529,20 @@ class RuntimeCore:
                     )
                     return result.to_dict()
                 raise LoadConflictError(
-                    "a different artifact is already loaded; release all existing leases before switching",
+                    "the loaded execution identity differs; explicitly unload before changing artifact, engine, build, or LoadOptions",
                     details={
                         "loaded_artifact": self._loaded_artifact.to_dict(),
                         "requested_artifact": binding.to_dict(),
                         "loaded_execution_input_fingerprint": self._loaded_execution_input.fingerprint
                         if self._loaded_execution_input else None,
                         "requested_execution_input_fingerprint": direct_input.fingerprint if direct_input else None,
+                        "loaded_load_identity_fingerprint": self._loaded_load_identity.fingerprint
+                        if self._loaded_load_identity else None,
+                        "requested_load_identity_fingerprint": requested_load_identity.fingerprint,
+                        "requested_load_options": load_options_resolution.requested.to_dict(),
+                        "resolved_load_options": load_options_resolution.resolved.to_dict(),
+                        "effective_loaded_load_options": self._loaded_load_options.to_dict()
+                        if self._loaded_load_options else None,
                         "active_request_ids": list(self._active),
                         "lease_owners": sorted(self._leases),
                     },
@@ -332,8 +551,42 @@ class RuntimeCore:
                 raise RuntimeBusyError("runtime lifecycle is busy", details={"lifecycle_state": self._state.value})
             self._state = LifecycleState.LOADING
             started = time.perf_counter()
+            effective_load_options = load_options_resolution.effective
             try:
-                raw = selected.load_execution_input(direct_input) if direct_input is not None else selected.load(binding)
+                if isinstance(selected, LlamaCppAdapter) and verified_gguf is not None:
+                    raw = selected.load_verified_gguf(binding, load_options_resolution, verified_gguf)
+                    if direct_input is not None:
+                        raw.update(
+                            {
+                                "execution_input_kind": direct_input.kind,
+                                "execution_input_fingerprint": direct_input.fingerprint,
+                                "adapter_count": 0,
+                            }
+                        )
+                elif options_were_explicit:
+                    raw = (
+                        selected.load_execution_input_with_options(direct_input, load_options_resolution)
+                        if direct_input is not None
+                        else selected.load_with_options(binding, load_options_resolution)
+                    )
+                else:
+                    raw = selected.load_execution_input(direct_input) if direct_input is not None else selected.load(binding)
+                if options_were_explicit and raw.get("effective_load_options") is not None:
+                    reported_effective = LoadOptions.from_payload(raw["effective_load_options"])
+                    raw_resolutions = raw.get("load_option_resolutions", [])
+                    if not isinstance(raw_resolutions, (tuple, list)):
+                        raise ValueError("load_option_resolutions must be an array")
+                    resolution_records = tuple(
+                        item if isinstance(item, OptionResolutionV3) else OptionResolutionV3(**item)
+                        for item in raw_resolutions
+                    )
+                    load_options_resolution = LoadOptionsResolutionV1(
+                        requested=load_options_resolution.requested,
+                        resolved=load_options_resolution.resolved,
+                        effective=reported_effective,
+                        resolutions=load_options_resolution.resolutions + resolution_records,
+                    )
+                    effective_load_options = reported_effective
             except RuntimeFoundationError as exc:
                 self._state = LifecycleState.ERROR
                 self._last_error = exc.as_dict()
@@ -348,6 +601,13 @@ class RuntimeCore:
             self._loaded_artifact_v2 = artifact_v2
             self._loaded_execution_input = direct_input
             self._loaded_adapter = selected
+            self._loaded_load_options = effective_load_options
+            self._loaded_load_options_resolution = load_options_resolution
+            self._loaded_load_identity = LoadIdentityV1.create(
+                artifact=artifact_v2,
+                engine=engine_binding,
+                effective_load_options=effective_load_options,
+            )
             self._leases[owner] = new_id("lease")
             self._state = LifecycleState.LOADED
             self._last_error = None
@@ -361,12 +621,20 @@ class RuntimeCore:
                 raw={
                     **raw,
                     "load_duration_ms": self._last_load_duration_ms,
+                    **({"gguf_validation": gguf_observation} if gguf_observation is not None else {}),
                     **({
                         "execution_input": direct_input.to_dict(),
                         "execution_input_fingerprint": direct_input.fingerprint,
                     } if direct_input is not None else {}),
                 },
             )
+            if options_were_explicit:
+                result.raw.update(
+                    {
+                        "load_identity": self._loaded_load_identity.to_dict(),
+                        "load_options_resolution": load_options_resolution.to_dict(),
+                    }
+                )
             return result.to_dict()
 
     def unload(
@@ -434,6 +702,9 @@ class RuntimeCore:
             self._loaded_artifact_v2 = None
             self._loaded_execution_input = None
             self._loaded_adapter = None
+            self._loaded_load_options = None
+            self._loaded_load_options_resolution = None
+            self._loaded_load_identity = None
             self._state = LifecycleState.UNLOADED
             return UnloadResult(
                 artifact_id=loaded.artifact_id,
@@ -1122,6 +1393,387 @@ class RuntimeCore:
 
         return iterator()
 
+    @staticmethod
+    def _bridge_v3_request(request: GenerationRequestV3) -> tuple[GenerationRequestV3, GenerationRequestV2]:
+        request_id = request.request_id or new_id("req")
+        normalized = request if request.request_id == request_id else replace(request, request_id=request_id)
+        options = normalized.generation_options
+        bridge = GenerationRequestV2(
+            model_artifact_id=normalized.model_artifact_id,
+            messages=[dict(item) for item in normalized.messages],
+            request_id=request_id,
+            consumer_id=normalized.consumer_id,
+            lease_id=normalized.lease_id,
+            max_tokens=options.max_tokens,
+            temperature=options.temperature,
+            top_p=options.top_p,
+            thinking_enabled=options.thinking_intent.to_legacy_enabled(),
+            timeout_ms=normalized.execution_constraints.timeout_ms,
+            metadata=dict(normalized.metadata),
+            thinking_intent=options.thinking_intent,
+            studio_resolved_thinking=normalized.studio_resolved_thinking,
+            execution_input=normalized.execution_input,
+        )
+        return normalized, bridge
+
+    def _execution_evidence_v3(
+        self,
+        request: GenerationRequestV3,
+        selected: EngineAdapter,
+    ) -> tuple[ExecutionEvidenceV3, GenerationOptions, PreparedGenerationV3]:
+        with self._lock:
+            artifact = self._loaded_artifact_v2
+            load_resolution = self._loaded_load_options_resolution
+            effective_load_options = self._loaded_load_options
+            load_identity = self._loaded_load_identity
+            execution_input = self._loaded_execution_input
+        if artifact is None or effective_load_options is None or load_identity is None:
+            raise ModelNotLoadedError("no v3 load identity is available")
+        if load_resolution is None:
+            load_resolution = LoadOptionsResolutionV1(
+                requested=effective_load_options,
+                resolved=effective_load_options,
+                effective=effective_load_options,
+            )
+        load_evidence = SettingsEvidenceV3.from_options(
+            scope="LOAD",
+            requested=load_resolution.requested,
+            resolved=load_resolution.resolved,
+            effective=load_resolution.effective,
+            resolutions=load_resolution.resolutions,
+        )
+        generation_evidence = selected.resolve_generation_options_v3(request)
+        effective_generation = GenerationOptions.from_payload(generation_evidence.effective)
+        prepared = selected.prepare_generation_v3(request, effective_generation)
+        if not isinstance(prepared, PreparedGenerationV3):
+            raise EngineRuntimeError(
+                "engine adapter returned an invalid v3 prepared generation",
+                details={"engine": selected.name},
+            )
+
+        requested_constraints = request.execution_constraints
+        resolved_constraints = requested_constraints
+        effective_constraints = requested_constraints
+        constraint_resolutions: tuple[OptionResolutionV3, ...] = ()
+        loaded_context = effective_load_options.model_context_size
+        requested_budget = requested_constraints.max_context_tokens
+        if requested_budget is not None and loaded_context is not None and requested_budget > loaded_context:
+            capped_budget = loaded_context
+            resolved_constraints = replace(requested_constraints, max_context_tokens=capped_budget)
+            effective_constraints = resolved_constraints
+            constraint_resolutions = (
+                OptionResolutionV3(
+                    path="max_context_tokens",
+                    requested=requested_budget,
+                    resolved=capped_budget,
+                    effective=capped_budget,
+                    status="resolved",
+                    reason="execution budget was capped at the effective loaded model context size",
+                ),
+            )
+        constraints_evidence = SettingsEvidenceV3.from_options(
+            scope="CONSTRAINT",
+            requested=requested_constraints,
+            resolved=resolved_constraints,
+            effective=effective_constraints,
+            resolutions=constraint_resolutions,
+        )
+        if effective_constraints.max_context_tokens is not None:
+            prompt_tokens = prepared.prompt_tokens
+            if prompt_tokens is None:
+                raise UnsupportedRuntimeOptionError(
+                    "the selected engine cannot provide a verified prompt-token count for max_context_tokens",
+                    details={"engine": selected.name, "constraint": "max_context_tokens", "generation_started": False},
+                )
+            required = prompt_tokens + effective_generation.max_tokens
+            if required > effective_constraints.max_context_tokens:
+                raise ContextLengthExceededError(
+                    "prompt plus requested generation exceeds max_context_tokens",
+                    details={
+                        "prompt_tokens": prompt_tokens,
+                        "max_tokens": effective_generation.max_tokens,
+                        "required_tokens": required,
+                        "max_context_tokens": effective_constraints.max_context_tokens,
+                        "generation_started": False,
+                    },
+                )
+
+        engine_binding = EngineBindingV2.from_legacy(
+            selected.identity(),
+            adapter_id=selected.name,
+            build_identity=selected.build_identity(),
+        )
+        foundation_binding = FoundationBindingV2(
+            contract_version=CONTRACT_V3_VERSION,
+            foundation_version=self.foundation_version,
+            build_identity=self.foundation_build_identity,
+            adapter_id=selected.name,
+        )
+        binding = ExecutionBindingV3.create(
+            artifact=artifact,
+            engine=engine_binding,
+            foundation=foundation_binding,
+            effective_load_options=effective_load_options,
+            effective_generation_options=effective_generation,
+            effective_constraints=effective_constraints,
+            execution_input=execution_input,
+        )
+        return (
+            ExecutionEvidenceV3(
+                execution_binding=binding,
+                options=ExecutionOptionsEvidenceV3(
+                    load=load_evidence,
+                    generation=generation_evidence,
+                    constraints=constraints_evidence,
+                ),
+            ),
+            effective_generation,
+            prepared,
+        )
+
+    def _save_v3_trace(self, trace: ExecutionTraceV3) -> None:
+        with self._lock:
+            self._v3_traces[trace.execution_id] = trace
+            if len(self._v3_traces) > 256:
+                oldest = next(iter(self._v3_traces))
+                self._v3_traces.pop(oldest, None)
+
+    def get_execution_v3(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            trace = self._v3_traces.get(execution_id)
+        return trace.to_dict() if trace else None
+
+    def generate_v3(self, request: GenerationRequestV3) -> GenerationResultV3:
+        normalized_request, bridge = self._bridge_v3_request(request)
+        _, selected, cancel_event, timeout_event, legacy_trace = self._begin(bridge)
+        trace = ExecutionTraceV3(
+            execution_id=legacy_trace.execution_id,
+            request_id=bridge.request_id,
+            engine=EngineBindingV2.from_legacy(
+                selected.identity(), adapter_id=selected.name, build_identity=selected.build_identity()
+            ).to_dict(),
+            artifact_identity=(self._loaded_artifact_v2 or ArtifactBindingV2.from_legacy(legacy_trace.artifact)).canonical_payload(),
+            status="running",
+            started_at=legacy_trace.started_at,
+        )
+        try:
+            evidence, effective_options, prepared = self._execution_evidence_v3(normalized_request, selected)
+            trace.evidence = evidence
+            self._raise_if_timed_out(bridge, timeout_event, legacy_trace)
+            result = selected.generate_v3(normalized_request, effective_options, cancel_event, prepared=prepared)
+            self._raise_if_timed_out(bridge, timeout_event, legacy_trace)
+            if result.metrics.load_duration_ms is None:
+                result.metrics.load_duration_ms = self._last_load_duration_ms
+            if result.metrics.unload_duration_ms is None:
+                result.metrics.unload_duration_ms = self._last_unload_duration_ms
+            trace.status = "completed"
+            trace.metrics = {key: value for key, value in result.metrics.to_dict().items() if key != "contract_version"}
+            trace.finish_reason = result.finish_reason
+            trace.finished_at = utc_now()
+            usage = {key: value for key, value in result.usage.to_dict().items() if key != "contract_version"}
+            self._last_error = None
+            return GenerationResultV3(
+                request_id=bridge.request_id,
+                model_artifact_id=normalized_request.model_artifact_id,
+                engine=selected.name,
+                text=result.text,
+                finish_reason=result.finish_reason,
+                usage=usage,
+                metrics=trace.metrics,
+                execution_id=trace.execution_id,
+                evidence=evidence,
+            )
+        except RuntimeFoundationError as exc:
+            if timeout_event.is_set() and exc.code != "runtime_timeout":
+                exc = self._timeout_error(bridge, legacy_trace)
+            exc.details.setdefault("execution_id", legacy_trace.execution_id)
+            trace.status = "cancelled" if exc.code == "cancelled" else "error"
+            trace.error = error_payload(exc, execution_id=legacy_trace.execution_id)
+            trace.finished_at = utc_now()
+            self._last_error = trace.error
+            raise exc
+        except Exception as exc:
+            wrapped = EngineRuntimeError(
+                "engine generation failed", details={"engine": selected.name, "execution_id": legacy_trace.execution_id}
+            )
+            trace.status = "error"
+            trace.error = error_payload(wrapped, execution_id=legacy_trace.execution_id)
+            trace.finished_at = utc_now()
+            self._last_error = trace.error
+            raise wrapped from exc
+        finally:
+            if trace.status == "running":
+                trace.status = "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
+                trace.finished_at = utc_now()
+            self._save_v3_trace(trace)
+            self._end(bridge.request_id)
+
+    def stream_v3(self, request: GenerationRequestV3) -> Iterator[StreamEventV3]:
+        normalized_request, bridge = self._bridge_v3_request(request)
+        _, selected, cancel_event, timeout_event, legacy_trace = self._begin(bridge)
+        trace = ExecutionTraceV3(
+            execution_id=legacy_trace.execution_id,
+            request_id=bridge.request_id,
+            engine=EngineBindingV2.from_legacy(
+                selected.identity(), adapter_id=selected.name, build_identity=selected.build_identity()
+            ).to_dict(),
+            artifact_identity=(self._loaded_artifact_v2 or ArtifactBindingV2.from_legacy(legacy_trace.artifact)).canonical_payload(),
+            status="running",
+            started_at=legacy_trace.started_at,
+        )
+
+        def iterator() -> Iterator[StreamEventV3]:
+            sequence = 0
+            adapter_events: Iterator[StreamEvent] | None = None
+            terminal = False
+
+            def close_adapter_events() -> None:
+                close = getattr(adapter_events, "close", None)
+                if callable(close):
+                    close()
+
+            def error_event(exc: RuntimeFoundationError) -> StreamEventV3:
+                exc.details.setdefault("execution_id", trace.execution_id)
+                trace.status = "cancelled" if exc.code == "cancelled" else "error"
+                trace.error = error_payload(exc, execution_id=trace.execution_id)
+                trace.finished_at = utc_now()
+                self._last_error = trace.error
+                return StreamEventV3(
+                    type="error",
+                    request_id=bridge.request_id,
+                    sequence=sequence + 1,
+                    execution_id=trace.execution_id,
+                    evidence=trace.evidence,
+                    done=True,
+                    error=trace.error,
+                )
+
+            try:
+                evidence, effective_options, prepared = self._execution_evidence_v3(normalized_request, selected)
+                trace.evidence = evidence
+                self._raise_if_timed_out(bridge, timeout_event, legacy_trace)
+                yield StreamEventV3(
+                    type="started",
+                    request_id=bridge.request_id,
+                    sequence=sequence,
+                    execution_id=trace.execution_id,
+                    evidence=evidence,
+                )
+                adapter_events = iter(
+                    selected.stream_v3(normalized_request, effective_options, cancel_event, prepared=prepared)
+                )
+                for event in adapter_events:
+                    self._raise_if_timed_out(bridge, timeout_event, legacy_trace)
+                    if event.type == "started":
+                        continue
+                    sequence += 1
+                    if event.type == "completed" and event.result is not None:
+                        result = dict(event.result)
+                        usage = dict(result.get("usage") or {})
+                        usage.pop("contract_version", None)
+                        metrics = dict(result.get("metrics") or {})
+                        metrics.pop("contract_version", None)
+                        metrics.setdefault("load_duration_ms", self._last_load_duration_ms)
+                        result_payload = {
+                            "contract_version": CONTRACT_V3_VERSION,
+                            "schema_version": "runtime-foundation.generation-result.v3",
+                            "request_id": bridge.request_id,
+                            "model_artifact_id": normalized_request.model_artifact_id,
+                            "engine": selected.name,
+                            "text": result.get("text", ""),
+                            "finish_reason": result.get("finish_reason", "unknown"),
+                            "usage": usage,
+                            "metrics": metrics,
+                            "execution_id": trace.execution_id,
+                            "execution_evidence": evidence.to_dict(),
+                        }
+                        trace.status = "completed"
+                        trace.metrics = metrics
+                        trace.finish_reason = result_payload["finish_reason"]
+                        trace.finished_at = utc_now()
+                        event_payload = StreamEventV3(
+                            type="completed",
+                            request_id=bridge.request_id,
+                            sequence=sequence,
+                            execution_id=trace.execution_id,
+                            evidence=evidence,
+                            done=True,
+                            result=result_payload,
+                        )
+                        terminal = True
+                        close_adapter_events()
+                        self._save_v3_trace(trace)
+                        self._end(bridge.request_id)
+                        yield event_payload
+                        return
+                    if event.type == "error":
+                        error = dict(event.error or {})
+                        error.setdefault("details", {})["execution_id"] = trace.execution_id
+                        if timeout_event.is_set() and error.get("code") != "runtime_timeout":
+                            normalized_error = self._timeout_error(bridge, legacy_trace)
+                            event_payload = error_event(normalized_error)
+                        else:
+                            trace.status = "cancelled" if error.get("code") == "cancelled" else "error"
+                            trace.error = error
+                            trace.finished_at = utc_now()
+                            self._last_error = error
+                            event_payload = StreamEventV3(
+                                type="error",
+                                request_id=bridge.request_id,
+                                sequence=sequence,
+                                execution_id=trace.execution_id,
+                                evidence=evidence,
+                                done=True,
+                                error=error,
+                            )
+                        terminal = True
+                        close_adapter_events()
+                        self._save_v3_trace(trace)
+                        self._end(bridge.request_id)
+                        yield event_payload
+                        return
+                    yield StreamEventV3(
+                        type=event.type,
+                        request_id=bridge.request_id,
+                        sequence=sequence,
+                        execution_id=trace.execution_id,
+                        evidence=evidence,
+                        delta=event.delta,
+                        done=event.done,
+                        result=event.result,
+                        error=event.error,
+                        timestamp=event.timestamp,
+                    )
+                self._raise_if_timed_out(bridge, timeout_event, legacy_trace)
+                raise EngineRuntimeError("engine stream ended without a terminal event", details={"engine": selected.name})
+            except RuntimeFoundationError as exc:
+                if timeout_event.is_set() and exc.code != "runtime_timeout":
+                    exc = self._timeout_error(bridge, legacy_trace)
+                terminal = True
+                close_adapter_events()
+                event_payload = error_event(exc)
+                self._save_v3_trace(trace)
+                self._end(bridge.request_id)
+                yield event_payload
+            except Exception as exc:
+                wrapped = EngineRuntimeError("engine streaming failed", details={"engine": selected.name})
+                terminal = True
+                close_adapter_events()
+                event_payload = error_event(wrapped)
+                self._save_v3_trace(trace)
+                self._end(bridge.request_id)
+                yield event_payload
+            finally:
+                close_adapter_events()
+                if not terminal:
+                    if trace.status == "running":
+                        trace.status = "error" if timeout_event.is_set() else "cancelled" if cancel_event.is_set() else "abandoned"
+                        trace.finished_at = utc_now()
+                    self._save_v3_trace(trace)
+                    self._end(bridge.request_id)
+
+        return iterator()
+
     def cancel(self, request_id: str) -> dict[str, Any]:
         with self._lock:
             active = self._active.get(request_id)
@@ -1179,6 +1831,13 @@ class RuntimeCore:
         if loaded_input is not None:
             payload["loaded_execution_input_kind"] = loaded_input.kind
             payload["loaded_execution_input_fingerprint"] = loaded_input.fingerprint
+        return payload
+
+    def health_v3(self) -> dict[str, Any]:
+        payload = self.health()
+        payload["contract_version"] = CONTRACT_V3_VERSION
+        payload["supported_contract_versions"] = list(SUPPORTED_CONTRACT_VERSIONS_V3)
+        payload["host_execution_capabilities"] = self.host_v3()["execution_capabilities"]
         return payload
 
     def runtime_metrics(self) -> dict[str, Any]:
