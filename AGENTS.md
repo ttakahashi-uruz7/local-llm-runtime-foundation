@@ -41,12 +41,14 @@ The MLX adapter is lazy and must remain import-safe on Windows. It must not turn
 
 ## Git
 
-Use an explicitly selected Git executable for the current operating system. Before repository operations, verify that the executable exists, is runnable, and reports its version; use its absolute path so PATH ordering cannot silently select a different implementation.
+Git executable is fixed by the current operating system. Determine the OS before repository operations and do not carry a Git requirement from one OS to another.
 
-- macOS: use Apple Git at `/usr/bin/git`. Verify it with `/usr/bin/git --version` and confirm that it runs on the current machine architecture. Sourcetree is not required on macOS.
-- Windows: use Sourcetree Embedded Git at `C:\Users\user\AppData\Local\Atlassian\Sourcetree\git_local\cmd\git.exe` when it is installed and executable.
+- macOS: use Apple Git at `/usr/bin/git`. Verify it with `/usr/bin/git --version`. Do not search for, require, or treat Sourcetree Embedded Git as a macOS prerequisite.
+- Windows: use Sourcetree Embedded Git at `C:\Users\user\AppData\Local\Atlassian\Sourcetree\git_local\cmd\git.exe` when it is installed and executable. Do not silently substitute a PATH/system Git.
 
-Do not silently switch to another executable if the selected one is missing or fails verification; stop and resolve the environment or obtain an explicit policy update. The Windows Sourcetree path is not a macOS prerequisite. Do not use force push, reset --hard, git clean, history rewrite, or destructive changes to sibling repositories. Do not commit directly to `main`; main merge always requires explicit user approval.
+Before repository operations, record the current OS, the selected Git executable absolute path, and its version. If the canonical executable for the current OS is missing or fails verification, stop the Git-dependent operation rather than silently switching implementations.
+
+Do not use force push, reset --hard, git clean, history rewrite, or destructive changes to sibling repositories. Do not commit directly to `main`; main merge always requires explicit user approval.
 
 The Benchmark reference PR #10 remains open. This repository must not close, merge, or repurpose that PR.
 
