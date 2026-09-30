@@ -7,6 +7,7 @@ the cooperative cancellation and native-crash boundary.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib
 import importlib.metadata
@@ -88,6 +89,7 @@ _TEMPLATE_INTENT_NAMES = {
     "effort": ("thinking_effort", "reasoning_effort"),
     "budget": ("thinking_budget_tokens", "thinking_budget"),
 }
+_NATIVE_LOG_CALLBACK_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ class NativeBinding:
     gpu_offload: bool | None
     metal_build: bool | None
     chat_format_module: Any | None = None
+    native_version: str | None = None
+    native_commit: str | None = None
 
 
 def _text(value: Any) -> str | None:
@@ -126,11 +130,129 @@ def _sha256_file(path: str | None) -> str | None:
         return None
 
 
-def _metal_marker(system_info: str | None) -> bool | None:
-    if not system_info:
+def _native_api_string(api: Any, symbol: str) -> str | None:
+    """Read a native no-argument string API without assuming it is bound in Python."""
+
+    library = getattr(api, "_lib", None)
+    function = getattr(library, symbol, None)
+    if not callable(function):
         return None
-    match = re.search(r"\bMetal\s*[=:]\s*([01])\b", system_info, flags=re.IGNORECASE)
-    return bool(int(match.group(1))) if match else None
+    try:
+        function.argtypes = []
+        function.restype = ctypes.c_char_p
+        return _text(function())
+    except Exception:  # noqa: BLE001 - native build metadata is optional evidence
+        return None
+
+
+def _metal_marker(system_info: str | None, api: Any | None = None) -> bool | None:
+    """Observe a Metal build marker or a registered native Metal backend.
+
+    Newer llama.cpp builds report ``MTL`` (Metal) through ggml's public backend
+    registry API rather than including a ``Metal=1`` marker in system info.
+    Missing registry APIs or an uninitialized registry remain unknown.
+    """
+
+    if system_info:
+        match = re.search(r"\bMetal\s*[=:]\s*([01])\b", system_info, flags=re.IGNORECASE)
+        if match:
+            return bool(int(match.group(1)))
+
+    library = getattr(api, "_lib", None)
+    count_fn = getattr(library, "ggml_backend_reg_count", None)
+    get_fn = getattr(library, "ggml_backend_reg_get", None)
+    name_fn = getattr(library, "ggml_backend_reg_name", None)
+    if not all(callable(fn) for fn in (count_fn, get_fn, name_fn)):
+        return None
+    try:
+        count_fn.argtypes = []
+        count_fn.restype = ctypes.c_size_t
+        get_fn.argtypes = [ctypes.c_size_t]
+        get_fn.restype = ctypes.c_void_p
+        name_fn.argtypes = [ctypes.c_void_p]
+        name_fn.restype = ctypes.c_char_p
+        count = int(count_fn())
+        if count <= 0:
+            return None
+        for index in range(count):
+            name = _text(name_fn(get_fn(index)))
+            if name and name.casefold() in {"mtl", "metal"}:
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - preserve unknown instead of guessing
+        return None
+
+
+def _construct_native_model(native: NativeBinding, kwargs: dict[str, Any]) -> tuple[Any, tuple[str, ...]]:
+    """Construct a model while briefly observing llama.cpp's native load log.
+
+    llama.cpp exposes a process-global logger. Serialize Foundation model
+    construction while wrapping that callback, and always forward the original
+    callback and restore it before returning.
+    """
+
+    api = native.api
+    log_get = getattr(api, "llama_log_get", None)
+    log_set = getattr(api, "llama_log_set", None)
+    callback_type = getattr(api, "llama_log_callback", None)
+    if not callable(log_get) or not callable(log_set) or not callable(callback_type):
+        return native.llama_class(**kwargs), ()
+
+    captured: list[str] = []
+    with _NATIVE_LOG_CALLBACK_LOCK:
+        original_callback = callback_type()
+        original_user_data = ctypes.c_void_p()
+        try:
+            log_get(ctypes.byref(original_callback), ctypes.byref(original_user_data))
+        except Exception:  # noqa: BLE001 - log observation is optional; model load remains authoritative
+            return native.llama_class(**kwargs), ()
+
+        @callback_type
+        def capture(level: int, text: bytes, _user_data: ctypes.c_void_p) -> None:
+            message = _text(text)
+            if message and (
+                ("offloaded " in message.lower() and " layers to gpu" in message.lower())
+                or re.search(r"\bMTL\d+\s+compute buffer size\b", message, flags=re.IGNORECASE)
+                or "ggml_metal_init: found device:" in message.lower()
+            ):
+                captured.append(message)
+            if original_callback:
+                original_callback(level, text, original_user_data)
+
+        log_set(capture, ctypes.c_void_p())
+        try:
+            model = native.llama_class(**kwargs)
+        finally:
+            log_set(original_callback, original_user_data)
+    return model, tuple(captured)
+
+
+def _native_metal_load_observation(lines: tuple[str, ...]) -> dict[str, Any]:
+    """Summarize native evidence that model layers and compute buffers use MTL."""
+
+    offload: tuple[int, int] | None = None
+    devices: list[str] = []
+    metal_compute_buffers: list[str] = []
+    for line in lines:
+        match = re.search(r"offloaded\s+(\d+)/(\d+)\s+layers to GPU", line, flags=re.IGNORECASE)
+        if match:
+            offload = (int(match.group(1)), int(match.group(2)))
+        if "ggml_metal_init: found device:" in line.lower():
+            devices.append(line.split(":", 2)[-1].strip())
+        if re.search(r"\bMTL\d+\s+compute buffer size\b", line, flags=re.IGNORECASE):
+            metal_compute_buffers.append(line)
+    all_layers_offloaded = bool(offload and offload[0] > 0 and offload[0] == offload[1])
+    confirmed = bool(offload and offload[0] > 0) and bool(metal_compute_buffers) and bool(devices)
+    return {
+        "status": "confirmed" if confirmed else "unobserved",
+        "source": "llama.cpp native load log",
+        "offloaded_layers": offload[0] if offload else None,
+        "total_layers": offload[1] if offload else None,
+        "all_model_layers_offloaded": all_layers_offloaded,
+        "metal_device_observations": devices,
+        "metal_compute_buffer_observations": metal_compute_buffers,
+        "log_lines": list(lines),
+    }
 
 
 def _read_native_binding() -> tuple[NativeBinding | None, str | None]:
@@ -176,8 +298,10 @@ def _read_native_binding() -> tuple[NativeBinding | None, str | None]:
             library_path=library_path,
             library_sha256=_sha256_file(library_path),
             gpu_offload=gpu_offload,
-            metal_build=_metal_marker(system_info),
+            metal_build=_metal_marker(system_info, api),
             chat_format_module=chat_format_module,
+            native_version=_native_api_string(api, "ggml_version"),
+            native_commit=_native_api_string(api, "ggml_commit"),
         ),
         None,
     )
@@ -249,6 +373,8 @@ class LlamaCppAdapter(EngineAdapter):
                         },
                         "native_library": {
                             "implementation": "llama.cpp",
+                            "version": native.native_version,
+                            "commit": native.native_commit,
                             "system_info": native.system_info,
                             "path": native.library_path,
                             "sha256": native.library_sha256,
@@ -912,7 +1038,11 @@ class LlamaCppAdapter(EngineAdapter):
                 "backend": options.acceleration.backend,
                 "gpu_offload_layers": options.acceleration.gpu_offload_layers,
                 "native_n_gpu_layers": observed_layers,
-                "actual_kernel_execution": "not_independently_observed",
+                "actual_kernel_execution": (
+                    "not_applicable_cpu_selected"
+                    if options.acceleration.backend == "cpu"
+                    else "not_observed"
+                ),
             },
         }
 
@@ -973,9 +1103,16 @@ class LlamaCppAdapter(EngineAdapter):
                 "verbose": False,
                 "use_mmap": True,
             }
-            llama = native.llama_class(**kwargs)
+            llama, native_load_log = _construct_native_model(native, kwargs)
             verified.revalidate()
             effective_state = self._effective_native_state(native, llama, options)
+            metal_observation = _native_metal_load_observation(native_load_log)
+            acceleration_state = effective_state["acceleration"]
+            if options.acceleration.backend == "metal":
+                acceleration_state["native_metal_load_observation"] = metal_observation
+                acceleration_state["actual_kernel_execution"] = (
+                    "pending_generation" if metal_observation["status"] == "confirmed" else "not_observed"
+                )
             self._validate_native_metadata(verified.observed, getattr(llama, "metadata", {}))
             formatter, template_text, variables = self._select_chat_formatter(native, llama)
             with self._lock:
@@ -996,7 +1133,16 @@ class LlamaCppAdapter(EngineAdapter):
                     "backend": options.acceleration.backend,
                     "gpu_offload_layers": options.acceleration.gpu_offload_layers,
                     "native_build_metal": native.metal_build,
-                    "actual_kernel_execution": "not_independently_observed",
+                    "actual_kernel_execution": (
+                        "pending_generation"
+                        if options.acceleration.backend == "metal" and metal_observation["status"] == "confirmed"
+                        else "not_observed"
+                        if options.acceleration.backend == "metal"
+                        else "not_applicable_cpu_selected"
+                    ),
+                    "native_metal_load_observation": (
+                        metal_observation if options.acceleration.backend == "metal" else None
+                    ),
                 }
             if old_verified is not None:
                 old_verified.close()
@@ -1058,7 +1204,13 @@ class LlamaCppAdapter(EngineAdapter):
             claims[f"{observed.architecture}.context_length"] = observed.context_length
         for key, expected in claims.items():
             actual = native_metadata.get(key)
-            if actual is not None and actual != expected:
+            matches = actual == expected
+            if isinstance(expected, int) and not isinstance(expected, bool) and isinstance(actual, str):
+                try:
+                    matches = int(actual, 10) == expected
+                except ValueError:
+                    matches = False
+            if actual is not None and not matches:
                 raise ArtifactCompatibilityError(
                     "native llama.cpp metadata differs from the validated GGUF metadata",
                     details={"metadata_key": key, "observed": expected, "native": actual},
@@ -1739,6 +1891,20 @@ class LlamaCppAdapter(EngineAdapter):
         text = choices[0].get("text", "")
         return (text if isinstance(text, str) else str(text or "")), choices[0].get("finish_reason")
 
+    def _record_native_metal_generation(self) -> None:
+        with self._lock:
+            selected = self._selected_execution_acceleration
+            if not isinstance(selected, dict) or selected.get("backend") != "metal":
+                return
+            observation = selected.get("native_metal_load_observation")
+            if not isinstance(observation, dict) or observation.get("status") != "confirmed":
+                return
+            selected["actual_kernel_execution"] = "confirmed_by_native_metal_offload_and_generated_token"
+            selected["generation_output_observed"] = True
+            selected["generation_confirmation_source"] = (
+                "llama.cpp native generation yielded output after MTL device, compute buffer, and GPU layer-offload observations"
+            )
+
     def stream(self, request: GenerationRequest, cancel_event: threading.Event) -> Iterator[StreamEvent]:
         yield from self._stream_common(request, None, cancel_event)
 
@@ -1904,6 +2070,7 @@ class LlamaCppAdapter(EngineAdapter):
                     finish_reason = str(chunk_finish_reason)
                 if delta:
                     generated_chunks += 1
+                    self._record_native_metal_generation()
                     if not text_parts:
                         metrics.cold_ttft_ms = (time.perf_counter() - started) * 1000
                     text_parts.append(delta)

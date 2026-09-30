@@ -13,7 +13,13 @@ from typing import Any
 import pytest
 
 from runtime_foundation import HostExecutionCapabilitiesV3, HostProfile, RuntimeCore
-from runtime_foundation.adapters.llama_cpp import LlamaCppAdapter, NativeBinding
+from runtime_foundation.adapters.llama_cpp import (
+    LlamaCppAdapter,
+    NativeBinding,
+    _metal_marker,
+    _native_api_string,
+    _native_metal_load_observation,
+)
 from runtime_foundation.contracts import GenerationRequest, RuntimeOptions
 from runtime_foundation.contracts_v2 import (
     ArtifactBindingV2,
@@ -32,6 +38,7 @@ from runtime_foundation.contracts_v3 import (
     LoadOptions,
 )
 from runtime_foundation.errors import (
+    ArtifactCompatibilityError,
     ContextLengthExceededError,
     EngineRuntimeError,
     LoadConflictError,
@@ -628,6 +635,24 @@ def test_native_capability_keeps_cpu_and_metal_observations_independent(tmp_path
             )
 
 
+def test_explicit_metal_request_fails_closed_when_native_build_is_non_metal(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "test-only.gguf"
+    _gguf(path)
+    adapter = LlamaCppAdapter(native=_native(metal=False, gpu_offload=True), host_profile=HostProfile.mock_windows())
+    monkeypatch.setattr(adapter, "_host_metal_observation", lambda: (True, "fixture host Metal"))
+
+    with VerifiedGGUFArtifact.open(_artifact(path)) as verified:
+        with pytest.raises(UnsupportedRuntimeOptionError, match="both a Metal-enabled") as caught:
+            adapter.resolve_load_options_with_observation(
+                _artifact(path).to_legacy(),
+                LoadOptions(acceleration=AccelerationConfiguration(backend="metal")),
+                verified.observed,
+            )
+
+    assert caught.value.details["native_build_metal"] is False
+    assert caught.value.details["host_metal"] is True
+
+
 def test_unobserved_build_and_host_metal_stay_unknown(monkeypatch) -> None:
     adapter = LlamaCppAdapter(native=_native(metal=None, gpu_offload=None))
     monkeypatch.setattr(adapter, "_host_capability", lambda _host: (None, "fixture host Metal unknown"))
@@ -644,6 +669,95 @@ def test_unobserved_build_and_host_metal_stay_unknown(monkeypatch) -> None:
     assert capability.options["acceleration.backend"].evidence["metal_capability_status"] == "unknown"
     assert host_capability.llama_cpp_availability.value == "supported"
     assert host_capability.llama_cpp_build_metal.value == "unknown"
+
+
+def test_native_build_probe_reads_ggml_registry_and_native_version() -> None:
+    registry = ("CPU", "MTL")
+
+    def count() -> int:
+        return len(registry)
+
+    def get(index: int) -> int:
+        return index + 1
+
+    def name(registration: int) -> bytes:
+        return registry[registration - 1].encode()
+
+    def version() -> bytes:
+        return b"0.20.0"
+
+    def commit() -> bytes:
+        return b"4df29be-dirty"
+
+    api = SimpleNamespace(
+        _lib=SimpleNamespace(
+            ggml_backend_reg_count=count,
+            ggml_backend_reg_get=get,
+            ggml_backend_reg_name=name,
+            ggml_version=version,
+            ggml_commit=commit,
+        )
+    )
+    assert _metal_marker("MTL : EMBED_LIBRARY = 1", api) is True
+    assert _native_api_string(api, "ggml_version") == "0.20.0"
+    assert _native_api_string(api, "ggml_commit") == "4df29be-dirty"
+
+    cpu_only = SimpleNamespace(_lib=SimpleNamespace(
+        ggml_backend_reg_count=lambda: 1,
+        ggml_backend_reg_get=lambda _index: 1,
+        ggml_backend_reg_name=lambda _registration: b"CPU",
+    ))
+    assert _metal_marker(None, cpu_only) is False
+    assert _metal_marker(None, SimpleNamespace()) is None
+
+
+def test_native_metal_execution_evidence_requires_device_buffer_and_offloaded_layers() -> None:
+    observation = _native_metal_load_observation(
+        (
+            "load_tensors: offloaded 29/29 layers to GPU",
+            "ggml_metal_init: found device: Apple M5 Max",
+            "sched_reserve: MTL0 compute buffer size = 37.34 MiB",
+        )
+    )
+    assert observation["status"] == "confirmed"
+    assert observation["all_model_layers_offloaded"] is True
+    assert observation["offloaded_layers"] == 29
+    assert observation["metal_device_observations"] == ["Apple M5 Max"]
+
+    no_metal_device = _native_metal_load_observation(("load_tensors: offloaded 29/29 layers to GPU",))
+    assert no_metal_device["status"] == "unobserved"
+
+    adapter = LlamaCppAdapter(native=_native(metal=True, gpu_offload=True))
+    adapter._selected_execution_acceleration = {
+        "backend": "metal",
+        "actual_kernel_execution": "pending_generation",
+        "native_metal_load_observation": observation,
+    }
+    adapter._record_native_metal_generation()
+    assert adapter._selected_execution_acceleration["actual_kernel_execution"] == (
+        "confirmed_by_native_metal_offload_and_generated_token"
+    )
+
+
+def test_native_metadata_numeric_strings_match_gguf_numeric_observations() -> None:
+    observed = SimpleNamespace(
+        architecture="qwen3",
+        file_type=2,
+        context_length=40960,
+        chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    )
+    native_metadata = {
+        "general.architecture": "qwen3",
+        "general.file_type": "2",
+        "qwen3.context_length": "40960",
+        "tokenizer.chat_template": observed.chat_template,
+    }
+    LlamaCppAdapter._validate_native_metadata(observed, native_metadata)
+
+    native_metadata["general.file_type"] = "3"
+    with pytest.raises(ArtifactCompatibilityError) as exc_info:
+        LlamaCppAdapter._validate_native_metadata(observed, native_metadata)
+    assert exc_info.value.details == {"metadata_key": "general.file_type", "observed": 2, "native": "3"}
 
 
 def test_unavailable_binding_is_reported_as_unavailable_not_unsupported(monkeypatch) -> None:
