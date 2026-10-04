@@ -11,7 +11,7 @@ Canonical current specifications live under `docs/current/`. Historical Benchmar
 Foundation owns:
 
 - Engine Adapter interface and capability discovery.
-- MLX / `mlx-lm` execution, Mock execution, and the future llama.cpp boundary.
+- MLX / `mlx-lm` execution, Mock execution, and the Current llama.cpp execution boundary.
 - Host observation: platform, architecture, OS, hardware, memory, Metal/MLX availability, memory pressure, and swap observations.
 - Artifact binding validation, model load/unload, generation, streaming, cancellation, lifecycle, health, requested/effective settings, raw metrics, and execution traces.
 - The versioned local service and Python client boundary.
@@ -35,7 +35,7 @@ Consumers decide whether Foundation observations satisfy their own policies.
 
 ## Windows and Mac
 
-Windows is the development and Mock/HTTP contract environment. Real MLX, Metal, Apple Unified Memory, swap behavior, memory pressure, and throughput require an Apple Silicon Mac. Until that validation is complete, report **REAL MAC PRODUCTION VALIDATION PENDING**.
+Windows is the development and Mock/HTTP contract environment. Real MLX, Metal, Apple Unified Memory, swap behavior, memory pressure, and throughput require an Apple Silicon Mac. The recorded Foundation real-Mac execution validation is complete; Windows results still must not be substituted for that evidence, and Foundation validation must never be represented as Benchmark Production Eligibility.
 
 The MLX adapter is lazy and must remain import-safe on Windows. It must not turn the absence of MLX into a cloud fallback or a fake production result.
 
@@ -50,7 +50,7 @@ Before repository operations, record the current OS, the selected Git executable
 
 Do not use force push, reset --hard, git clean, history rewrite, or destructive changes to sibling repositories. Do not commit directly to `main`; main merge always requires explicit user approval.
 
-The Benchmark reference PR #10 remains open. This repository must not close, merge, or repurpose that PR.
+Foundation PR #10 is merged historical validation evidence. Do not rewrite, repurpose, or present that historical PR state as an open approval gate.
 
 ## Autonomous PR workflow
 
