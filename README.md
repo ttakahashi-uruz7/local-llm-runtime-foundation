@@ -50,12 +50,9 @@ The Python client preserves Foundation remote errors without policy reinterpreta
 - Historical v1 extraction baseline: `c00328e0356e706b0ab6504ef8fba2219a65778c`
 - Default local service: `http://127.0.0.1:8765`
 - Service bind is loopback-only (`127.0.0.1`, `::1`, or `localhost`); unauthenticated LAN/remote binding is rejected.
-- `GET /health`, `GET /host`, `GET /engines`
-- `GET /engines/{engine}/capability`
-- `POST /models/load`, `POST /models/unload`
-- `POST /generate`, `POST /generate/stream`
-- `POST /requests/{request_id}/cancel`
-- `GET /runtime/metrics`, `GET /executions/{execution_id}`
+- Legacy/default v1-compatible routes remain available at `/health`, `/host`, `/engines`, `/models/*`, `/generate*`, `/requests/*`, and `/executions/*`.
+- Current v3 routes use the explicit `/v3` prefix, including `GET /v3/health`, `GET /v3/host`, `GET /v3/engines`, `POST /v3/models/load`, `POST /v3/models/unload`, `POST /v3/generate`, `POST /v3/generate/stream`, `POST /v3/requests/{request_id}/cancel`, and `GET /v3/executions/{execution_id}`.
+- Consumers must use the route family matching the versioned request/contract; v3 semantics are not inferred by silently reinterpreting a v1/v2 payload.
 
 See [RUNTIME_CONTRACT.md](docs/current/RUNTIME_CONTRACT.md), [DUAL_RUNTIME_CONTRACT_V3.md](docs/current/DUAL_RUNTIME_CONTRACT_V3.md), and [INTEGRATION_GUIDE.md](docs/current/INTEGRATION_GUIDE.md).
 
