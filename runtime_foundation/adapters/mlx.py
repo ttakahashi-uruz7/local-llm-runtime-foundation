@@ -74,7 +74,9 @@ from ..contracts_v3 import (
     SettingsEvidenceV3,
 )
 from ..host import runtime_snapshot
-from .base import EngineAdapter, PreparedGenerationV3
+from .base import EngineAdapter, PreparedGenerationV3, off_without_template_control_resolution
+
+_NO_THINKING_CONTROL_REASON = "loaded chat template has no enable_thinking control"
 
 
 class MLXAdapter(EngineAdapter):
@@ -336,7 +338,7 @@ class MLXAdapter(EngineAdapter):
             return CapabilityStatus.UNKNOWN, f"loaded chat-template variables could not be inspected: {type(exc).__name__}", ()
         if "enable_thinking" in variables:
             return CapabilityStatus.SUPPORTED, "loaded chat template references enable_thinking", variables
-        return CapabilityStatus.UNSUPPORTED, "loaded chat template has no enable_thinking control", variables
+        return CapabilityStatus.UNSUPPORTED, _NO_THINKING_CONTROL_REASON, variables
 
     def _chat_template_status(self) -> tuple[CapabilityStatus, str]:
         mlx, _, _ = self._modules()
@@ -685,7 +687,17 @@ class MLXAdapter(EngineAdapter):
                 details={"engine": self.name, "requested": intent.to_dict()},
             )
         status, reason, _ = self._thinking_template_status()
-        if status != CapabilityStatus.SUPPORTED:
+        effective_intent = request.studio_resolved_thinking if intent.mode.value == "AUTO" else intent
+        # An inspected template with no thinking control has no thinking mode to
+        # switch off, so OFF is its only representation. ON and uninspectable
+        # templates still fail closed.
+        off_without_template_control = (
+            status == CapabilityStatus.UNSUPPORTED
+            and reason == _NO_THINKING_CONTROL_REASON
+            and effective_intent is not None
+            and effective_intent.mode.value == "OFF"
+        )
+        if status != CapabilityStatus.SUPPORTED and not off_without_template_control:
             raise UnsupportedGenerationSettingError(
                 "the loaded MLX chat template cannot verifiably represent the requested Thinking Intent",
                 details={"engine": self.name, "requested": intent.to_dict(), "capability_status": status.value, "reason": reason},
@@ -843,6 +855,8 @@ class MLXAdapter(EngineAdapter):
                     reason="null resolves to the installed mlx-lm repetition processor context-size default",
                 )
             )
+        if off_without_template_control:
+            resolutions.append(off_without_template_control_resolution(("enable_thinking",)))
         return SettingsEvidenceV3.from_options(
             scope="GENERATION",
             requested=options,
