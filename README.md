@@ -14,7 +14,7 @@ Novel / Benchmark / Learning
              ▼
 Local Runtime Service
              ▼
-Foundation Core → MLX Adapter (primary) / Mock Adapter / llama.cpp skeleton
+Foundation Core → MLX Adapter / Mock Adapter / llama.cpp Adapter
 ```
 
 The service owns one loaded model process. Consumer leases prevent one consumer from unloading or replacing another consumer's loaded artifact. The Core has no dependency on Benchmark Registry, Evidence, Optimizer, Quality, Deployment, Novel, or Learning modules.
@@ -43,23 +43,20 @@ The Python client preserves Foundation remote errors without policy reinterpreta
 
 ## Contract and service
 
-- Contract version: `runtime-foundation.contract.v1`
-- Supported contracts: `runtime-foundation.contract.v1`, `runtime-foundation.contract.v2`
+- Current contract: `runtime-foundation.contract.v3`
+- Supported contracts: `runtime-foundation.contract.v1`, `runtime-foundation.contract.v2`, `runtime-foundation.contract.v3`
 - Foundation version: `0.2.0`
-- Runtime package / contract baseline commit: `c00328e0356e706b0ab6504ef8fba2219a65778c`
-- Repository canonicalization merge: `753bbd935b444542a269bb93d8bb2e42172b5225` (repository operating documentation only; runtime baseline remains `c00328e...`)
+- Current runtime / contract pin: `5a93213d9c17c8e8ce774375a585f8420ca2ab8f`
+- Historical v1 extraction baseline: `c00328e0356e706b0ab6504ef8fba2219a65778c`
 - Default local service: `http://127.0.0.1:8765`
 - Service bind is loopback-only (`127.0.0.1`, `::1`, or `localhost`); unauthenticated LAN/remote binding is rejected.
-- `GET /health`, `GET /host`, `GET /engines`
-- `GET /engines/{engine}/capability`
-- `POST /models/load`, `POST /models/unload`
-- `POST /generate`, `POST /generate/stream`
-- `POST /requests/{request_id}/cancel`
-- `GET /runtime/metrics`, `GET /executions/{execution_id}`
+- Legacy/default v1-compatible routes remain available at `/health`, `/host`, `/engines`, `/models/*`, `/generate*`, `/requests/*`, and `/executions/*`.
+- Current v3 routes use the explicit `/v3` prefix, including `GET /v3/health`, `GET /v3/host`, `GET /v3/engines`, `POST /v3/models/load`, `POST /v3/models/unload`, `POST /v3/generate`, `POST /v3/generate/stream`, `POST /v3/requests/{request_id}/cancel`, and `GET /v3/executions/{execution_id}`.
+- Consumers must use the route family matching the versioned request/contract; v3 semantics are not inferred by silently reinterpreting a v1/v2 payload.
 
-See [RUNTIME_CONTRACT.md](docs/current/RUNTIME_CONTRACT.md) and [INTEGRATION_GUIDE.md](docs/current/INTEGRATION_GUIDE.md).
+See [RUNTIME_CONTRACT.md](docs/current/RUNTIME_CONTRACT.md), [DUAL_RUNTIME_CONTRACT_V3.md](docs/current/DUAL_RUNTIME_CONTRACT_V3.md), and [INTEGRATION_GUIDE.md](docs/current/INTEGRATION_GUIDE.md).
 
-RAH-1 v2 details are in [RAH1_CONTRACT_V2.md](docs/current/RAH1_CONTRACT_V2.md), and active RAH-2 guard enforcement is documented in [RAH2_SAFETY_COMPATIBILITY_GATE.md](docs/current/RAH2_SAFETY_COMPATIBILITY_GATE.md). v2 separates registry artifact identity, complete/fast content identity, and locator; separates MLX engine family from `mlx-lm` implementation; records first-class deterministic Build Identity evidence for Foundation and observed engines; binds Foundation and effective runtime settings; exposes deterministic execution fingerprints; and hard-blocks guarded execution before adapter generation when expected state does not match or cannot be certified. The Foundation remains policy-free. A second MLX runtime, real llama.cpp execution, LM Studio integration, and production performance conclusions are deferred.
+RAH-1 v2 details are in [RAH1_CONTRACT_V2.md](docs/current/RAH1_CONTRACT_V2.md), and active RAH-2 guard enforcement is documented in [RAH2_SAFETY_COMPATIBILITY_GATE.md](docs/current/RAH2_SAFETY_COMPATIBILITY_GATE.md). v2 separates registry artifact identity, complete/fast content identity, and locator; separates MLX engine family from `mlx-lm` implementation; records first-class deterministic Build Identity evidence for Foundation and observed engines; binds Foundation and effective runtime settings; exposes deterministic execution fingerprints; and hard-blocks guarded execution before adapter generation when expected state does not match or cannot be certified. The Foundation remains policy-free. llama.cpp execution is part of the Current v3 boundary through the optional native binding. A second MLX runtime, LM Studio integration, and broader production-performance conclusions remain deferred.
 
 ## Repository history reference
 
