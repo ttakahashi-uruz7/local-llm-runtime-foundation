@@ -80,7 +80,7 @@ from ..errors import (
 )
 from ..gguf import GGUFObservedMetadata, VerifiedGGUFArtifact
 from ..host import HostProfile, host_metal_capability, process_memory_bytes
-from .base import EngineAdapter, PreparedGenerationV3
+from .base import EngineAdapter, PreparedGenerationV3, off_without_template_control_resolution
 
 
 _GGML_KV_TYPES = ("f16", "q8_0")
@@ -1522,6 +1522,16 @@ class LlamaCppAdapter(EngineAdapter):
             )
         kwargs: dict[str, Any] = {}
         thinking_name = next((name for name in _TEMPLATE_INTENT_NAMES["thinking"] if name in variables), None)
+        if (
+            thinking_name is None
+            and resolved.mode == ThinkingMode.OFF
+            and resolved.effort is None
+            and resolved.budget_tokens is None
+        ):
+            # An inspected template with no thinking control has no thinking mode
+            # to switch off, so OFF renders without template kwargs. The empty
+            # kwargs tell the caller to record that observation.
+            return resolved, kwargs
         if thinking_name is None:
             raise UnsupportedGenerationSettingError(
                 "the selected GGUF chat template cannot represent the requested Thinking Intent",
@@ -1612,7 +1622,7 @@ class LlamaCppAdapter(EngineAdapter):
                     "native_scope": "LOAD",
                 },
             )
-        resolved_intent, _ = self._thinking_parameters(
+        resolved_intent, thinking_kwargs = self._thinking_parameters(
             options.thinking_intent,
             studio_resolved=request.studio_resolved_thinking,
         )
@@ -1651,6 +1661,8 @@ class LlamaCppAdapter(EngineAdapter):
             for field in ("mode", "effort", "budget_tokens")
             if requested_intent[field] != resolved_intent_values[field]
         ]
+        if not thinking_kwargs:
+            resolutions.append(off_without_template_control_resolution(_TEMPLATE_INTENT_NAMES["thinking"]))
         requested_values = options.to_dict()
         effective_values = effective.to_dict()
         reasons = {

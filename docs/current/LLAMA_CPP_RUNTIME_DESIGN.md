@@ -59,6 +59,11 @@ Thinking intent is passed only through template variables the selected
 metadata template actually references. `thinking_supported`, effort support,
 and budget support are artifact-applicable capability observations. A requested
 intent that the template cannot express is rejected before generation.
+The exception is a resolved `OFF` (no effort, no budget) on a template whose
+variables were inspected and include no thinking control: it renders without
+template thinking kwargs and records a `thinking_intent.template_control`
+resolution with status `observed`. A template whose variables cannot be
+inspected still fails closed.
 `llama-cpp-python` LoRA load parameters are a future extension point; this
 adapter does not claim direct Base+Adapter support in this phase.
 

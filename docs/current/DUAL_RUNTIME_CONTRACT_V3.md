@@ -63,7 +63,9 @@ reject the request. Engine-specific unsupported controls are capability
 Thinking `AUTO` requires the Studio to supply an explicit `ON` or `OFF`
 resolution. The adapter must show how the chosen GGUF template/runtime
 represents each requested intent. Unsupported effort or token budget is
-rejected; it is never dropped silently.
+rejected; it is never dropped silently. A resolved `OFF` on an inspected template that has no
+thinking control is represented by rendering without a thinking flag and is
+recorded as described for each adapter below.
 
 ### MLX adapter boundary
 
@@ -91,6 +93,12 @@ termination guarantee. Per-request seed is unsupported because the current
 MLX random state is not isolated by this adapter. Thinking intent is supported
 only when the loaded tokenizer template can be inspected and exposes
 `enable_thinking`; effort and token budgets remain unsupported.
+A template that was inspected and has no `enable_thinking` control has no
+thinking mode to switch off, so a resolved `OFF` intent runs on it; the
+settings evidence records a `thinking_intent.template_control` resolution with
+status `observed`. `ON`, and any intent on a template that cannot be inspected,
+still fail closed. Foundation does not claim the model emits no reasoning text;
+the consumer checks outputs.
 
 These mappings follow the installed runtime's inspected signatures. The
 upstream API references are [mlx-lm generation](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py)
