@@ -17,7 +17,11 @@ from runtime_foundation import (
     ThinkingMode,
 )
 from runtime_foundation.adapters.mlx import MLXAdapter
-from runtime_foundation.errors import ContextLengthExceededError, UnsupportedRuntimeOptionError
+from runtime_foundation.errors import (
+    ContextLengthExceededError,
+    UnsupportedGenerationSettingError,
+    UnsupportedRuntimeOptionError,
+)
 
 
 @pytest.fixture
@@ -221,3 +225,28 @@ def test_mlx_v3_stop_sequence_is_trimmed_across_stream_chunks(mlx_fixture) -> No
     assert "".join(deltas) == "answer"
     assert result["text"] == "answer"
     assert result["finish_reason"] == "stop_sequence"
+
+
+def test_mlx_v3_thinking_off_runs_on_a_template_without_thinking_control(mlx_fixture) -> None:
+    core, adapter, artifact, calls = mlx_fixture
+    core.load(artifact, adapter="mlx", load_options=LoadOptions(), consumer_id="mlx-contract-test")
+    # A Llama-style template has no enable_thinking control.
+    adapter._tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    assert adapter.discover_capability_v3().thinking_supported.status.value == "unsupported"
+
+    result = core.generate_v3(_request(artifact, request_id="mlx-off-without-control")).to_dict()
+    evidence = result["execution_evidence"]["options"]["generation"]
+    assert evidence["effective"]["thinking_intent"]["mode"] == "OFF"
+    resolutions = {item["path"]: item for item in evidence["resolutions"]}
+    observed = resolutions["thinking_intent.template_control"]
+    assert observed["status"] == "observed"
+    assert observed["requested"] == ["enable_thinking"]
+    assert any("stream_prompt" in call for call in calls)
+
+    on_request = _request(
+        artifact,
+        options=GenerationOptions(max_tokens=2, temperature=0.7, thinking_intent=ThinkingIntent(mode=ThinkingMode.ON)),
+        request_id="mlx-on-without-control",
+    )
+    with pytest.raises(UnsupportedGenerationSettingError, match="cannot verifiably represent"):
+        core.generate_v3(on_request)

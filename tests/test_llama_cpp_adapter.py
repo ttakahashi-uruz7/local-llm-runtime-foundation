@@ -852,3 +852,41 @@ def test_v3_cooperative_cancel_and_timeout_emit_normalized_events(tmp_path: Path
 
     _FakeLlama.pause_before_first_chunk = 0.0
     core.unload()
+
+
+def test_thinking_off_runs_on_a_template_without_thinking_control(tmp_path: Path) -> None:
+    path = tmp_path / "test-only.gguf"
+    _gguf(path)
+    core, adapter = _runtime(path)
+    loaded = core.load(_artifact(path), load_options=_load_options())
+    # A Llama-style template references messages but no thinking control.
+    adapter._template_variables = frozenset({"messages", "bos_token"})
+
+    result = core.generate_v3(_request("local-test-gguf", loaded["lease_id"], request_id="off-without-control"))
+    assert result.text == "hello world"
+    assert "enable_thinking" not in _FakeLlama.instances[-1].template_calls[-1]
+    resolutions = {
+        item["path"]: item for item in result.evidence.options.generation.to_dict()["resolutions"]
+    }
+    observed = resolutions["thinking_intent.template_control"]
+    assert observed["status"] == "observed"
+    assert observed["requested"] == ["enable_thinking", "thinking"]
+    assert result.evidence.options.generation.effective["thinking_intent"]["mode"] == "OFF"
+
+    calls_before = len(_FakeLlama.instances[-1].completion_calls)
+    with pytest.raises(UnsupportedGenerationSettingError, match="cannot represent the requested Thinking Intent"):
+        core.generate_v3(
+            _request(
+                "local-test-gguf",
+                loaded["lease_id"],
+                request_id="on-without-control",
+                thinking=ThinkingIntent(mode=ThinkingMode.ON),
+            )
+        )
+    assert len(_FakeLlama.instances[-1].completion_calls) == calls_before
+
+    adapter._template_variables = frozenset()
+    with pytest.raises(UnsupportedGenerationSettingError, match="verifiable thinking control"):
+        core.generate_v3(_request("local-test-gguf", loaded["lease_id"], request_id="off-uninspectable"))
+    assert len(_FakeLlama.instances[-1].completion_calls) == calls_before
+    core.unload()

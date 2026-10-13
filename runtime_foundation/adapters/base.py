@@ -43,6 +43,22 @@ class PreparedGenerationV3:
     adapter_state: Any = None
 
 
+def off_without_template_control_resolution(control_names: tuple[str, ...]) -> OptionResolutionV3:
+    """Record that Thinking OFF ran on a template that has no thinking control."""
+
+    return OptionResolutionV3(
+        path="thinking_intent.template_control",
+        requested=list(control_names),
+        resolved=None,
+        effective=None,
+        status="observed",
+        reason=(
+            "the loaded chat template references none of the listed thinking controls, so Thinking OFF "
+            "is rendered without a thinking flag; the consumer must check outputs for reasoning text"
+        ),
+    )
+
+
 class EngineAdapter(ABC):
     """The only execution interface Core may use for a model engine."""
 
