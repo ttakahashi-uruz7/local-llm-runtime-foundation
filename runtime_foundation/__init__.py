@@ -95,6 +95,7 @@ from .contracts_v3 import (
     LoadOptions,
     LoadIdentityV1,
     OptionResolutionV3,
+    SchedulingOptionsV3,
     SettingsEvidenceV3,
     StreamEventV3,
 )
@@ -188,6 +189,7 @@ __all__ = [
     "LoadIdentityV1",
     "LoadOptionsResolutionV1",
     "OptionResolutionV3",
+    "SchedulingOptionsV3",
     "SettingsEvidenceV3",
     "LifecycleState",
     "LoadResult",

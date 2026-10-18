@@ -6,6 +6,7 @@ uses distinct load, generation, and Foundation execution-budget objects.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,12 @@ EXECUTION_TRACE_V3_VERSION = "runtime-foundation.execution-trace.v3"
 GENERATION_RESULT_V3_VERSION = "runtime-foundation.generation-result.v3"
 STREAM_EVENT_V3_VERSION = "runtime-foundation.stream-event.v3"
 LOAD_IDENTITY_V1_VERSION = "runtime-foundation.load-identity.v1"
+SCHEDULING_OPTIONS_VERSION = "runtime-foundation.scheduling-options.v1"
+QUEUE_PRIORITIES = ("interactive", "background")
+DEFAULT_QUEUE_TIMEOUT_MS = 600_000
+MAX_QUEUE_TIMEOUT_MS = 3_600_000
+CHAT_MESSAGE_TOOL_FIELDS = ("tool_calls", "tool_call_id", "name")
+MAX_CHAT_TOOLS = 64
 
 
 def _keys(value: dict[str, Any], allowed: set[str], field_name: str) -> None:
@@ -381,12 +388,108 @@ class ExecutionConstraints:
         }
 
 
+def _json_copy(value: Any, field_name: str) -> Any:
+    """Return a detached copy of a JSON value, rejecting anything JSON cannot carry."""
+
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must contain only JSON values") from exc
+
+
+def _chat_tool(value: Any, index: int) -> dict[str, Any]:
+    field_name = f"tools[{index}]"
+    if not isinstance(value, dict) or value.get("type") != "function":
+        raise ValueError(f"{field_name} must be an object with type function")
+    function = value.get("function")
+    if not isinstance(function, dict) or not isinstance(function.get("name"), str) or not function["name"].strip():
+        raise ValueError(f"{field_name}.function.name is required")
+    parameters = function.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValueError(f"{field_name}.function.parameters must be an object when provided")
+    return _json_copy(value, field_name)
+
+
+def _chat_message(value: Any, index: int) -> dict[str, Any]:
+    """Validate one chat message; tool-call fields are kept, other extras are dropped as before."""
+
+    if not isinstance(value, dict) or not isinstance(value.get("role"), str) or not isinstance(value.get("content"), str):
+        raise ValueError(f"messages[{index}] requires string role and content")
+    message: dict[str, Any] = {"role": value["role"], "content": value["content"]}
+    tool_calls = value.get("tool_calls")
+    if tool_calls is not None:
+        if not isinstance(tool_calls, list) or not tool_calls:
+            raise ValueError(f"messages[{index}].tool_calls must be a non-empty array when provided")
+        for call_index, call in enumerate(tool_calls):
+            function = call.get("function") if isinstance(call, dict) else None
+            if (
+                not isinstance(call, dict)
+                or call.get("type", "function") != "function"
+                or not isinstance(function, dict)
+                or not isinstance(function.get("name"), str)
+                or not function["name"].strip()
+                or not isinstance(function.get("arguments", {}), (dict, str))
+            ):
+                raise ValueError(
+                    f"messages[{index}].tool_calls[{call_index}] requires a function name and object or string arguments"
+                )
+        message["tool_calls"] = _json_copy(tool_calls, f"messages[{index}].tool_calls")
+    for name in ("tool_call_id", "name"):
+        if value.get(name) is not None:
+            text = _optional_text(value.get(name), f"messages[{index}].{name}")
+            message[name] = text
+    return message
+
+
+@dataclass(frozen=True)
+class SchedulingOptionsV3:
+    """How a request waits for the single generation slot; never part of execution evidence."""
+
+    priority: str = "interactive"
+    queue_timeout_ms: int = DEFAULT_QUEUE_TIMEOUT_MS
+    schema_version: str = SCHEDULING_OPTIONS_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEDULING_OPTIONS_VERSION:
+            raise ValueError(f"scheduling.schema_version must be {SCHEDULING_OPTIONS_VERSION}")
+        if self.priority not in QUEUE_PRIORITIES:
+            raise ValueError(f"scheduling.priority must be one of {', '.join(QUEUE_PRIORITIES)}")
+        if (
+            not isinstance(self.queue_timeout_ms, int)
+            or isinstance(self.queue_timeout_ms, bool)
+            or not 0 <= self.queue_timeout_ms <= MAX_QUEUE_TIMEOUT_MS
+        ):
+            raise ValueError(f"scheduling.queue_timeout_ms must be an integer between 0 and {MAX_QUEUE_TIMEOUT_MS}")
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> SchedulingOptionsV3:
+        if payload is None:
+            return cls()
+        value = _mapping(payload, "scheduling")
+        _keys(value, {"contract_version", "schema_version", "priority", "queue_timeout_ms"}, "scheduling")
+        if value.get("contract_version", CONTRACT_V3_VERSION) != CONTRACT_V3_VERSION:
+            raise ValueError("scheduling contract_version must be runtime-foundation.contract.v3")
+        return cls(
+            priority=value.get("priority", "interactive"),
+            queue_timeout_ms=value.get("queue_timeout_ms", DEFAULT_QUEUE_TIMEOUT_MS),
+            schema_version=value.get("schema_version", SCHEDULING_OPTIONS_VERSION),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": CONTRACT_V3_VERSION,
+            "schema_version": self.schema_version,
+            "priority": self.priority,
+            "queue_timeout_ms": self.queue_timeout_ms,
+        }
+
+
 @dataclass(frozen=True)
 class GenerationRequestV3:
     """v3 generation payload: one authoritative options object per concern."""
 
     model_artifact_id: str
-    messages: tuple[dict[str, str], ...]
+    messages: tuple[dict[str, Any], ...]
     generation_options: GenerationOptions = field(default_factory=GenerationOptions)
     execution_constraints: ExecutionConstraints = field(default_factory=ExecutionConstraints)
     request_id: str | None = None
@@ -395,6 +498,8 @@ class GenerationRequestV3:
     studio_resolved_thinking: ThinkingIntent | None = None
     execution_input: ExecutionInputV1 | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    tools: tuple[dict[str, Any], ...] = ()
+    scheduling: SchedulingOptionsV3 = field(default_factory=SchedulingOptionsV3)
     schema_version: str = GENERATION_REQUEST_V3_VERSION
 
     def __post_init__(self) -> None:
@@ -405,14 +510,14 @@ class GenerationRequestV3:
         object.__setattr__(self, "model_artifact_id", self.model_artifact_id.strip())
         if not isinstance(self.messages, (tuple, list)) or not self.messages:
             raise ValueError("messages must be a non-empty array")
-        messages: list[dict[str, str]] = []
-        for index, message in enumerate(self.messages):
-            if not isinstance(message, dict) or not isinstance(message.get("role"), str) or not isinstance(
-                message.get("content"), str
-            ):
-                raise ValueError(f"messages[{index}] requires string role and content")
-            messages.append({"role": message["role"], "content": message["content"]})
-        object.__setattr__(self, "messages", tuple(messages))
+        object.__setattr__(
+            self, "messages", tuple(_chat_message(message, index) for index, message in enumerate(self.messages))
+        )
+        if not isinstance(self.tools, (tuple, list)) or len(self.tools) > MAX_CHAT_TOOLS:
+            raise ValueError(f"tools must be an array of at most {MAX_CHAT_TOOLS} function definitions")
+        object.__setattr__(self, "tools", tuple(_chat_tool(tool, index) for index, tool in enumerate(self.tools)))
+        if not isinstance(self.scheduling, SchedulingOptionsV3):
+            raise ValueError("scheduling must be validated SchedulingOptionsV3")
         for name in ("request_id", "consumer_id", "lease_id"):
             object.__setattr__(self, name, _optional_text(getattr(self, name), name))
         if not isinstance(self.generation_options, GenerationOptions):
@@ -444,6 +549,8 @@ class GenerationRequestV3:
                 "studio_resolved_thinking",
                 "execution_input",
                 "metadata",
+                "tools",
+                "scheduling",
             },
             "generation_request v3",
         )
@@ -456,6 +563,9 @@ class GenerationRequestV3:
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be an object")
         execution_input = value.get("execution_input")
+        tools = value.get("tools", [])
+        if not isinstance(tools, list):
+            raise ValueError("tools must be an array")
         return cls(
             model_artifact_id=value.get("model_artifact_id"),
             messages=tuple(messages),
@@ -469,8 +579,26 @@ class GenerationRequestV3:
             else None,
             execution_input=ExecutionInputV1.from_payload(execution_input) if execution_input is not None else None,
             metadata=dict(metadata),
+            tools=tuple(tools),
+            scheduling=SchedulingOptionsV3.from_payload(value.get("scheduling")),
             schema_version=value.get("schema_version", GENERATION_REQUEST_V3_VERSION),
         )
+
+    @property
+    def uses_chat_tools(self) -> bool:
+        """True when the chat template must render tool definitions or tool-call turns."""
+
+        return bool(self.tools) or any(
+            any(name in message for name in CHAT_MESSAGE_TOOL_FIELDS) for message in self.messages
+        )
+
+    def template_messages(self) -> list[dict[str, Any]]:
+        """Detached messages, including tool-call fields, for an engine chat template."""
+
+        return _json_copy(list(self.messages), "messages")
+
+    def template_tools(self) -> list[dict[str, Any]] | None:
+        return _json_copy(list(self.tools), "tools") if self.tools else None
 
     @classmethod
     def from_legacy_v1(cls, request: Any) -> GenerationRequestV3:
@@ -518,7 +646,7 @@ class GenerationRequestV3:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "contract_version": CONTRACT_V3_VERSION,
             "schema_version": self.schema_version,
             "model_artifact_id": self.model_artifact_id,
@@ -534,6 +662,11 @@ class GenerationRequestV3:
             "execution_input": self.execution_input.to_dict() if self.execution_input else None,
             "metadata": dict(self.metadata),
         }
+        if self.tools:
+            payload["tools"] = [dict(tool) for tool in self.tools]
+        if self.scheduling != SchedulingOptionsV3():
+            payload["scheduling"] = self.scheduling.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)

@@ -181,6 +181,7 @@ class EngineCapabilityV3:
     thinking_budget_supported: OptionCapabilityV3
     reason: str | None = None
     schema_version: str = CAPABILITY_V3_VERSION
+    chat_tools: OptionCapabilityV3 | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != CAPABILITY_V3_VERSION:
@@ -202,6 +203,8 @@ class EngineCapabilityV3:
         ):
             if not isinstance(value, OptionCapabilityV3):
                 raise ValueError("engine capability feature fields must be OptionCapabilityV3")
+        if self.chat_tools is not None and not isinstance(self.chat_tools, OptionCapabilityV3):
+            raise ValueError("engine capability chat_tools must be OptionCapabilityV3")
 
     @classmethod
     def from_legacy(
@@ -212,6 +215,7 @@ class EngineCapabilityV3:
         host_observation: dict[str, Any] | None = None,
         artifact: ArtifactBindingV2 | None = None,
         load_identity_fingerprint: str | None = None,
+        chat_tools_supported: bool = False,
     ) -> EngineCapabilityV3:
         host_fingerprint = canonical_fingerprint(host_observation) if host_observation is not None else None
         applicability = CapabilityApplicabilityV3(
@@ -295,6 +299,18 @@ class EngineCapabilityV3:
                 "supported" if legacy.generation_options.get("thinking_budget_tokens", {}).get("status") == "supported" else "unknown",
                 CapabilityScope.GENERATION,
             ),
+            chat_tools=OptionCapabilityV3(
+                status=(
+                    CapabilityStatus.UNAVAILABLE
+                    if not available
+                    else CapabilityStatus.SUPPORTED if chat_tools_supported else CapabilityStatus.UNSUPPORTED
+                ),
+                scope=CapabilityScope.GENERATION,
+                reason=None if chat_tools_supported and available else (
+                    legacy.reason if not available else "engine adapter does not accept chat tools"
+                ),
+                applicability=applicability,
+            ),
             reason=legacy.reason,
         )
 
@@ -313,6 +329,14 @@ class EngineCapabilityV3:
                 "thinking_supported": self.thinking_supported.to_dict(),
                 "thinking_effort_supported": self.thinking_effort_supported.to_dict(),
                 "thinking_budget_supported": self.thinking_budget_supported.to_dict(),
+                "chat_tools": (
+                    self.chat_tools
+                    or OptionCapabilityV3(
+                        status=CapabilityStatus.UNSUPPORTED,
+                        scope=CapabilityScope.GENERATION,
+                        reason="engine adapter does not accept chat tools",
+                    )
+                ).to_dict(),
             },
             "reason": self.reason,
         }

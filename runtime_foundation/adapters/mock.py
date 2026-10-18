@@ -39,6 +39,7 @@ class MockAdapter(EngineAdapter):
     """A contract test double; its timing and memory values are not production observations."""
 
     name = "mock"
+    supports_chat_tools_v3 = True
 
     _engine_options = {
         "mock.output_prefix": {"type": "string", "default": "Mock response"},

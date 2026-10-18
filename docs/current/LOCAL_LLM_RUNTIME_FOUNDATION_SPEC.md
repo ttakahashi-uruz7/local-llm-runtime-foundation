@@ -83,9 +83,9 @@ llama.cpp binding and its same-process failure guarantees are specified in
 
 ## 5. Lifecycle and consumer ownership
 
-The service holds at most one loaded execution composition and one active generation request. The composition is either one Single Artifact or a Direct Base plus zero-or-one Adapter. A consumer receives a lease when it loads a composition. Loading the same composition from another consumer reuses the physical model and creates a second lease. A consumer cannot unload a lease owned by another consumer. A different composition cannot replace a loaded composition until all leases are released. Unload while a request is active returns a conflict. Adapter hot swap while retaining the Base allocation is not guaranteed.
+The service holds at most one loaded execution composition and runs one generation request at a time; further requests wait in a priority queue (interactive before background) instead of failing, as defined in `DUAL_RUNTIME_CONTRACT_V3.md` (Generation queue). The composition is either one Single Artifact or a Direct Base plus zero-or-one Adapter. A consumer receives a lease when it loads a composition. Loading the same composition from another consumer reuses the physical model and creates a second lease. A consumer cannot unload a lease owned by another consumer. A different composition cannot replace a loaded composition until all leases are released. Unload while a request is active returns a conflict. Adapter hot swap while retaining the Base allocation is not guaranteed.
 
-This is a safety boundary, not a scheduling policy.
+This is a safety boundary. The queue only orders waiting requests by the priority the consumer declares; Foundation does not decide which consumer may use which model.
 
 ### 5.1 Host memory admission and single service instance
 
