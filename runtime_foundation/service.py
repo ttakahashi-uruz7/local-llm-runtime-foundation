@@ -14,6 +14,7 @@ from .contracts_v2 import CONTRACT_V2_VERSION, ArtifactBindingV2, ExecutionInput
 from .contracts_v3 import CONTRACT_V3_VERSION, GenerationRequestV3, LoadOptions
 from .core import RuntimeCore
 from .errors import InvalidRequestError, RuntimeFoundationError
+from .instance_lock import InstanceAlreadyRunningError, acquire_instance_lock, lock_path_from_environment
 from .network import validate_loopback_host
 from .version import FOUNDATION_VERSION
 
@@ -266,11 +267,19 @@ def main() -> None:
     import uvicorn
 
     host = validate_loopback_host(os.environ.get("RUNTIME_FOUNDATION_HOST", "127.0.0.1"))
-    uvicorn.run(
-        app,
-        host=host,
-        port=int(os.environ.get("RUNTIME_FOUNDATION_PORT", "8765")),
-    )
+    port = int(os.environ.get("RUNTIME_FOUNDATION_PORT", "8765"))
+    lock_path = lock_path_from_environment()
+    lock_handle = None
+    if lock_path is not None:
+        try:
+            lock_handle = acquire_instance_lock(lock_path, description=f"pid={os.getpid()} url=http://{host}:{port}")
+        except InstanceAlreadyRunningError as exc:
+            raise SystemExit(str(exc)) from exc
+    try:
+        uvicorn.run(app, host=host, port=port)
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
 
 
 if __name__ == "__main__":

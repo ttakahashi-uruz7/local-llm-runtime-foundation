@@ -87,6 +87,15 @@ The service holds at most one loaded execution composition and one active genera
 
 This is a safety boundary, not a scheduling policy.
 
+### 5.1 Host memory admission and single service instance
+
+Two kernel watchdog panics on a 64 GB Apple Silicon Mac (2026-10-09) happened when another local runtime held a model in Metal memory while Foundation loaded a second one. Two further safety boundaries protect the host:
+
+- **Load memory admission.** Before a fresh load (never on a reuse), Core reads macOS wired memory (`vm_stat`, `hw.memsize`) under the lifecycle lock and refuses the load with `host_memory_insufficient` (HTTP 409, not retryable) when wired memory plus the on-disk artifact size (Base plus Adapter) would exceed `RUNTIME_FOUNDATION_LOAD_MEMORY_LIMIT_RATIO` of physical memory. The default ratio is `0.85`; `off` disables the check. The Mock engine and hosts where wired memory cannot be observed are skipped and never blocked. Every successful fresh load records the observation in `LoadResult.raw.host_memory_preflight`.
+- **Single service instance.** `python -m runtime_foundation` takes an exclusive OS file lock (`RUNTIME_FOUNDATION_INSTANCE_LOCK`, default `~/.cache/local-llm-runtime-foundation/service.lock`; `off` disables) and exits before binding a port when another Foundation service already holds it, so two Foundation processes cannot each hold a model. The OS releases the lock when the process exits.
+
+Neither boundary sees memory that another runtime allocates after Foundation has loaded (for example LM Studio loading later), and neither covers consumers that load models in their own process without Foundation.
+
 ## 6. Policy-free rule
 
 Foundation may report `memory_pressure=critical`, `swap_delta_bytes`, or an engine failure. It never turns those observations into `VALID`, `INVALID`, `production_eligible`, quality scores, or deployment decisions.

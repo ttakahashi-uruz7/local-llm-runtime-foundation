@@ -126,7 +126,7 @@ The metrics payload can include load/unload duration, cold/warm TTFT, prefill to
 }
 ```
 
-Important error codes include `artifact_not_found`, `engine_not_found`, `engine_unavailable`, `engine_runtime_error`, `context_length_exceeded`, `model_not_loaded`, `runtime_busy`, `load_conflict`, `unload_conflict`, `unsupported_runtime_option`, `invalid_runtime_option`, `unsupported_generation_setting`, `cancelled`, and `runtime_timeout`. Direct execution also uses `unsupported_execution_input` for Adapter counts above one, `artifact_incompatible` for identity/lineage/shape mismatches, and `execution_input_mismatch` when a generation request does not identify the loaded composition.
+Important error codes include `artifact_not_found`, `engine_not_found`, `engine_unavailable`, `engine_runtime_error`, `context_length_exceeded`, `model_not_loaded`, `runtime_busy`, `load_conflict`, `host_memory_insufficient`, `unload_conflict`, `unsupported_runtime_option`, `invalid_runtime_option`, `unsupported_generation_setting`, `cancelled`, and `runtime_timeout`. Direct execution also uses `unsupported_execution_input` for Adapter counts above one, `artifact_incompatible` for identity/lineage/shape mismatches, and `execution_input_mismatch` when a generation request does not identify the loaded composition.
 
 The Foundation Python client raises `RemoteRuntimeError` for remote error responses and preserves the wire `code`, `message`, strict-boolean `retryable`, `details`, and HTTP `status_code`. Consumers such as Benchmark must use this Foundation-provided retryability and must not infer or recreate it from `code`.
 

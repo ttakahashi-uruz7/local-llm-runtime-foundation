@@ -81,6 +81,11 @@ class LoadConflictError(RuntimeFoundationError):
     retryable = True
 
 
+class HostMemoryInsufficientError(RuntimeFoundationError):
+    code = "host_memory_insufficient"
+    http_status = 409
+
+
 class UnloadConflictError(RuntimeFoundationError):
     code = "unload_conflict"
     http_status = 409
