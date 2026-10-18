@@ -76,6 +76,7 @@ from .errors import (
     ExecutionBindingUnresolvableError,
     ExecutionGuardMismatchError,
     ExecutionInputMismatchError,
+    HostMemoryInsufficientError,
     InvalidRequestError,
     LoadConflictError,
     ModelNotLoadedError,
@@ -91,6 +92,7 @@ from .errors import (
 from .engines import default_engine_for_artifact_format, engine_wire_identifier, normalize_engine_identifier
 from .host import HostProfile, host_metal_capability
 from .gguf import VerifiedGGUFArtifact
+from .memory_guard import LoadMemoryGuard
 from .version import FOUNDATION_VERSION
 
 DEFAULT_CONSUMER_ID = "anonymous"
@@ -125,7 +127,9 @@ class RuntimeCore:
         adapters: dict[str, EngineAdapter] | None = None,
         foundation_version: str = FOUNDATION_VERSION,
         foundation_build_identity: BuildIdentityV1 | dict[str, Any] | None = None,
+        load_memory_guard: LoadMemoryGuard | None = None,
     ) -> None:
+        self.load_memory_guard = load_memory_guard or LoadMemoryGuard.from_environment()
         self.foundation_version = foundation_version
         if foundation_build_identity is None:
             self.foundation_build_identity = observe_foundation_build_identity()
@@ -549,6 +553,17 @@ class RuntimeCore:
                 )
             if self._state in {LifecycleState.LOADING, LifecycleState.UNLOADING, LifecycleState.GENERATING}:
                 raise RuntimeBusyError("runtime lifecycle is busy", details={"lifecycle_state": self._state.value})
+            # Runs under the lifecycle lock and only when no model is held, so
+            # the observation cannot race another load through this process.
+            try:
+                memory_preflight = self.load_memory_guard.check(
+                    engine=selected.name,
+                    artifact_paths=[binding.local_path]
+                    + ([item.local_path for item in direct_input.adapters] if direct_input is not None else []),
+                )
+            except HostMemoryInsufficientError as exc:
+                self._last_error = exc.as_dict()
+                raise
             self._state = LifecycleState.LOADING
             started = time.perf_counter()
             effective_load_options = load_options_resolution.effective
@@ -621,6 +636,7 @@ class RuntimeCore:
                 raw={
                     **raw,
                     "load_duration_ms": self._last_load_duration_ms,
+                    "host_memory_preflight": memory_preflight,
                     **({"gguf_validation": gguf_observation} if gguf_observation is not None else {}),
                     **({
                         "execution_input": direct_input.to_dict(),

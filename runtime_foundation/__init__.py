@@ -66,6 +66,7 @@ from .contracts_v2 import (
 )
 from .core import InferenceManager, RuntimeCore
 from .host import HostProfile
+from .memory_guard import LoadMemoryGuard
 from .version import FOUNDATION_VERSION
 from .contracts_v3 import (
     CONTRACT_V3_VERSION,
@@ -173,6 +174,7 @@ __all__ = [
     "StreamEventV3",
     "HealthResult",
     "HostProfile",
+    "LoadMemoryGuard",
     "HostExecutionCapabilitiesV3",
     "CapabilityApplicabilityV3",
     "CapabilityDependency",
