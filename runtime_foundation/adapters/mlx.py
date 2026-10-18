@@ -81,6 +81,7 @@ _NO_THINKING_CONTROL_REASON = "loaded chat template has no enable_thinking contr
 
 class MLXAdapter(EngineAdapter):
     name = "mlx"
+    supports_chat_tools_v3 = True
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -606,6 +607,15 @@ class MLXAdapter(EngineAdapter):
                 CapabilityScope.GENERATION,
                 "MLX adapter does not expose a template or runtime thinking-token budget control",
             ),
+            chat_tools=option(
+                chat_template_status,
+                CapabilityScope.GENERATION,
+                "tool definitions and tool-call turns are passed to tokenizer.apply_chat_template; "
+                "the consumer parses tool calls from the generated text"
+                if chat_template_status == supported
+                else chat_template_reason,
+                allowed=("tokenizer.apply_chat_template",) if chat_template_status == supported else (),
+            ),
         )
 
     def resolve_load_options(self, artifact: ModelArtifactBinding, options: LoadOptions) -> LoadOptionsResolutionV1:
@@ -876,7 +886,12 @@ class MLXAdapter(EngineAdapter):
     ) -> PreparedGenerationV3:
         legacy = self._legacy_v2_request(request, effective_options)
         _, tokenizer, _ = self._ensure_loaded(legacy)
-        prompt = self._prompt(legacy, tokenizer)
+        if request.uses_chat_tools:
+            prompt = self._prompt(
+                legacy, tokenizer, messages=request.template_messages(), tools=request.template_tools()
+            )
+        else:
+            prompt = self._prompt(legacy, tokenizer)
         token_ids = self._prompt_token_ids(tokenizer, prompt)
         return PreparedGenerationV3(
             prompt_tokens=len(token_ids),
@@ -1319,10 +1334,25 @@ class MLXAdapter(EngineAdapter):
         return getattr(item, name, default)
 
     @staticmethod
-    def _prompt(request: GenerationRequest, tokenizer: Any) -> str:
-        messages = [{"role": str(message["role"]), "content": str(message["content"])} for message in request.messages]
+    def _prompt(
+        request: GenerationRequest,
+        tokenizer: Any,
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Render the chat prompt; v3 tool definitions and tool-call turns pass to the template unchanged."""
+
+        with_tools = messages is not None
+        if messages is None:
+            messages = [{"role": str(message["role"]), "content": str(message["content"])} for message in request.messages]
         template = getattr(tokenizer, "apply_chat_template", None)
         if not callable(template):
+            if with_tools:
+                raise UnsupportedGenerationSettingError(
+                    "the tokenizer does not expose a chat template for tools",
+                    details={"setting": "tools", "generation_started": False},
+                )
             if request.thinking_enabled is not None:
                 raise UnsupportedGenerationSettingError(
                     "the tokenizer does not expose a chat template for thinking_enabled",
@@ -1330,11 +1360,18 @@ class MLXAdapter(EngineAdapter):
                 )
             return "\n".join(f"{message['role']}: {message['content']}" for message in messages) + "\nassistant:"
         kwargs: dict[str, Any] = {"add_generation_prompt": True}
+        if tools:
+            kwargs["tools"] = tools
         if request.thinking_enabled is not None:
             kwargs["enable_thinking"] = request.thinking_enabled
         try:
             rendered = template(messages, **kwargs)
         except TypeError as exc:
+            if with_tools:
+                raise UnsupportedGenerationSettingError(
+                    "the tokenizer chat template does not accept tools or tool-call messages",
+                    details={"setting": "tools", "generation_started": False},
+                ) from exc
             if request.thinking_enabled is not None:
                 raise UnsupportedGenerationSettingError(
                     "the tokenizer chat template does not support thinking_enabled",

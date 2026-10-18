@@ -2,7 +2,7 @@
 
 - Status: **Canonical / Current**
 - Contract version: `runtime-foundation.contract.v3`
-- Added schemas: LoadOptions v1, GenerationOptions v1, ExecutionConstraints v1, Execution Binding v3, Execution Evidence v3, Execution Trace v3
+- Added schemas: LoadOptions v1, GenerationOptions v1, ExecutionConstraints v1, Execution Binding v3, Execution Evidence v3, Execution Trace v3, SchedulingOptions v1
 
 ## Compatibility boundary
 
@@ -126,6 +126,48 @@ load conflict. Foundation never recreates a context behind a live lease or
 generation request. The caller must release leases, unload, and then load the
 new identity. Existing wire lifecycle values remain unchanged.
 
+## Chat tools
+
+A v3 generation request may carry `tools`, an array of up to 64 function
+definitions in the common chat-completion shape
+(`{"type":"function","function":{"name":…,"parameters":{…}}}`). Messages may
+carry the tool-call turn fields `tool_calls` (assistant), `tool_call_id` and
+`name` (tool results). Other extra message fields are dropped, as before.
+Foundation validates the JSON shape only and passes tools and tool-call turns
+unchanged to the engine's chat template. It never executes a tool and never
+parses tool calls out of the generated text: the result text is returned as
+generated, and the consumer reads tool calls from it.
+
+The MLX adapter passes them to `tokenizer.apply_chat_template(..., tools=…)`.
+A template that cannot accept them fails with `unsupported_generation_setting`
+before generation; tools are never silently dropped. Adapters that do not
+support chat tools (llama.cpp today) refuse such requests the same way. The
+`features.chat_tools` capability reports which adapters accept them. Requests
+without tools render exactly as before. Tools and tool-call fields are not part
+of Execution Binding v3, so they do not change existing fingerprints.
+
+## Generation queue
+
+One generation runs at a time per service process. A request that arrives
+while another runs waits for the slot instead of failing with `runtime_busy`.
+The optional `scheduling` object (SchedulingOptions v1) controls the wait:
+
+- `priority`: `interactive` (default) or `background`. Waiting interactive
+  requests are admitted before waiting background requests; arrival order is
+  kept within a priority. A running request is never interrupted.
+- `queue_timeout_ms`: how long to wait, default 600000, maximum 3600000. When
+  the wait runs out the request fails with `runtime_busy`
+  (`generation_started: false`). `0` keeps the old immediate answer.
+
+v1 and v2 requests wait with the defaults. The queue wait is not part of
+`execution_constraints.timeout_ms`, which starts when generation is admitted.
+A waiting request is re-authorized when it is admitted, so an unload or a
+different load while it waits makes it fail with the usual error. Cancelling a
+waiting request removes it from the queue (`state: removed_from_queue`).
+`/v3/health` reports `generation_queue.queued_request_ids`; `active_request_ids`
+keeps listing only the running request. Scheduling is not execution evidence
+and is not part of any fingerprint.
+
 ## GGUF observed identity
 
 The existing Artifact Binding v2 remains the single artifact identity system.
@@ -163,5 +205,7 @@ llama.cpp build or a Metal execution.
 
 The versioned service surface is additive: `/v3/host`,
 `/v3/engines/{engine}/capability`, `/v3/models/load`, `/v3/generate`,
-`/v3/generate/stream`, and `/v3/executions/{id}`. Existing routes and clients
+`/v3/generate/stream`, and `/v3/executions/{id}`. `/v3/generate` and
+`/v3/generate/stream` accept the optional `tools` and `scheduling` fields, and
+`/v3/health` reports `generation_queue`. Existing routes and clients
 continue to serve v1/v2 contracts.

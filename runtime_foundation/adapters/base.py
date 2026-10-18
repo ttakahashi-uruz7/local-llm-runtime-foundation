@@ -63,6 +63,8 @@ class EngineAdapter(ABC):
     """The only execution interface Core may use for a model engine."""
 
     name: str
+    # Whether v3 requests may carry tool definitions and tool-call turns for the chat template.
+    supports_chat_tools_v3: bool = False
 
     def build_identity(self) -> Any | None:
         """Return structured observed build identity, or unknown."""
@@ -96,6 +98,7 @@ class EngineAdapter(ABC):
             host_observation=host_observation,
             artifact=artifact,
             load_identity_fingerprint=load_identity_fingerprint,
+            chat_tools_supported=self.supports_chat_tools_v3,
         )
 
     @abstractmethod
@@ -278,7 +281,7 @@ class EngineAdapter(ABC):
         thinking_enabled = options.thinking_intent.to_legacy_enabled()
         return GenerationRequestV2(
             model_artifact_id=request.model_artifact_id,
-            messages=[dict(item) for item in request.messages],
+            messages=[{"role": item["role"], "content": item["content"]} for item in request.messages],
             request_id=request.request_id or "",
             consumer_id=request.consumer_id,
             lease_id=request.lease_id,

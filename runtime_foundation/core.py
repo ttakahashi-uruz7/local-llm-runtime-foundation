@@ -49,6 +49,8 @@ from .contracts_v2 import (
 )
 from .contracts_v3 import (
     CONTRACT_V3_VERSION,
+    QUEUE_PRIORITIES,
+    SCHEDULING_OPTIONS_VERSION,
     SUPPORTED_CONTRACT_VERSIONS_V3,
     ExecutionBindingV3,
     ExecutionEvidenceV3,
@@ -61,6 +63,7 @@ from .contracts_v3 import (
     LoadOptions,
     LoadOptionsResolutionV1,
     OptionResolutionV3,
+    SchedulingOptionsV3,
     SettingsEvidenceV3,
     StreamEventV3,
 )
@@ -80,6 +83,7 @@ from .errors import (
     InvalidRequestError,
     LoadConflictError,
     ModelNotLoadedError,
+    RequestCancelledError,
     RuntimeBusyError,
     RuntimeFoundationError,
     RuntimeTimeoutError,
@@ -105,6 +109,22 @@ def _build_identity_payload(identity: Any | None) -> dict[str, Any] | None:
         payload = identity.to_dict()
         return payload if isinstance(payload, dict) else None
     return dict(identity) if isinstance(identity, dict) else None
+
+
+@dataclass
+class _QueuedRequest:
+    """A generation request waiting for the single generation slot."""
+
+    request_id: str
+    rank: int
+    sequence: int
+    enqueued_monotonic: float
+    cancelled: bool = False
+
+
+# Lower rank is admitted first; equal ranks keep arrival order.
+_QUEUE_RANK = {"interactive": 0, "background": 1}
+_QUEUE_POLL_SECONDS = 0.5
 
 
 @dataclass
@@ -162,6 +182,9 @@ class RuntimeCore:
         self._loaded_adapter: EngineAdapter | None = None
         self._leases: dict[str, str] = {}
         self._active: dict[str, _ActiveRequest] = {}
+        self._slot_released = threading.Condition(self._lock)
+        self._queued: dict[str, _QueuedRequest] = {}
+        self._queue_sequence = 0
         self._traces: dict[str, ExecutionTrace] = {}
         self._v3_traces: dict[str, ExecutionTraceV3] = {}
         self._last_error: dict[str, Any] | None = None
@@ -770,16 +793,71 @@ class RuntimeCore:
             )
         return loaded, selected, owner
 
+    def _wait_for_slot(self, request: GenerationRequest, scheduling: SchedulingOptionsV3) -> None:
+        """Hold the caller (lock held) until it owns the single generation slot.
+
+        One generation runs at a time. A request that arrives while another runs
+        waits instead of failing: interactive requests are admitted before
+        background requests, and arrival order is kept within a priority. The
+        queue wait is not part of the request's timeout_ms.
+        """
+
+        request_id = request.request_id
+        if request_id in self._active or request_id in self._queued:
+            raise RuntimeBusyError(
+                "a generation request with this request_id is already running or queued",
+                details={"request_id": request_id, "generation_started": False},
+            )
+        if not self._active and not self._queued:
+            return
+        self._queue_sequence += 1
+        entry = _QueuedRequest(
+            request_id=request_id,
+            rank=_QUEUE_RANK[scheduling.priority],
+            sequence=self._queue_sequence,
+            enqueued_monotonic=time.monotonic(),
+        )
+        self._queued[request_id] = entry
+        deadline = entry.enqueued_monotonic + scheduling.queue_timeout_ms / 1000
+        try:
+            while True:
+                if entry.cancelled:
+                    raise RequestCancelledError(
+                        "generation was cancelled while queued",
+                        details={"request_id": request_id, "generation_started": False, "queued": True},
+                    )
+                # The model may be unloaded or replaced while this request waits.
+                self._authorize_request(request)
+                head = min(self._queued.values(), key=lambda item: (item.rank, item.sequence))
+                if not self._active and head is entry:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeBusyError(
+                        "generation waited longer than scheduling.queue_timeout_ms for the generation slot",
+                        details={
+                            "request_id": request_id,
+                            "queue_timeout_ms": scheduling.queue_timeout_ms,
+                            "active_request_ids": list(self._active),
+                            "queued_request_ids": self._queued_request_ids(),
+                            "generation_started": False,
+                        },
+                    )
+                self._slot_released.wait(min(remaining, _QUEUE_POLL_SECONDS))
+        finally:
+            self._queued.pop(request_id, None)
+            self._slot_released.notify_all()
+
+    def _queued_request_ids(self) -> list[str]:
+        return [item.request_id for item in sorted(self._queued.values(), key=lambda item: (item.rank, item.sequence))]
+
     def _begin(
-        self, request: GenerationRequest
+        self, request: GenerationRequest, scheduling: SchedulingOptionsV3 | None = None
     ) -> tuple[ModelArtifactBinding, EngineAdapter, threading.Event, threading.Event, ExecutionTrace]:
         with self._lock:
+            self._authorize_request(request)
+            self._wait_for_slot(request, scheduling or SchedulingOptionsV3())
             loaded, selected, _ = self._authorize_request(request)
-            if self._active:
-                raise RuntimeBusyError(
-                    "Foundation v1 supports one active generation request per service process",
-                    details={"active_request_ids": list(self._active)},
-                )
             self._state = LifecycleState.GENERATING
             execution_id = new_id("execution")
             trace = ExecutionTrace(
@@ -1167,6 +1245,7 @@ class RuntimeCore:
                 active.timeout_timer.cancel()
             if self._state == LifecycleState.GENERATING and self._loaded_artifact is not None:
                 self._state = LifecycleState.LOADED
+            self._slot_released.notify_all()
 
     def _save_trace(self, trace: ExecutionTrace) -> None:
         with self._lock:
@@ -1409,6 +1488,17 @@ class RuntimeCore:
 
         return iterator()
 
+    def _require_chat_tools_support(self, request: GenerationRequestV3) -> None:
+        if not request.uses_chat_tools:
+            return
+        with self._lock:
+            selected = self._loaded_adapter
+        if selected is not None and not selected.supports_chat_tools_v3:
+            raise UnsupportedGenerationSettingError(
+                "the loaded engine adapter does not accept tools or tool-call messages",
+                details={"setting": "tools", "engine": selected.name, "generation_started": False},
+            )
+
     @staticmethod
     def _bridge_v3_request(request: GenerationRequestV3) -> tuple[GenerationRequestV3, GenerationRequestV2]:
         request_id = request.request_id or new_id("req")
@@ -1416,7 +1506,7 @@ class RuntimeCore:
         options = normalized.generation_options
         bridge = GenerationRequestV2(
             model_artifact_id=normalized.model_artifact_id,
-            messages=[dict(item) for item in normalized.messages],
+            messages=[{"role": item["role"], "content": item["content"]} for item in normalized.messages],
             request_id=request_id,
             consumer_id=normalized.consumer_id,
             lease_id=normalized.lease_id,
@@ -1561,7 +1651,8 @@ class RuntimeCore:
 
     def generate_v3(self, request: GenerationRequestV3) -> GenerationResultV3:
         normalized_request, bridge = self._bridge_v3_request(request)
-        _, selected, cancel_event, timeout_event, legacy_trace = self._begin(bridge)
+        self._require_chat_tools_support(normalized_request)
+        _, selected, cancel_event, timeout_event, legacy_trace = self._begin(bridge, normalized_request.scheduling)
         trace = ExecutionTraceV3(
             execution_id=legacy_trace.execution_id,
             request_id=bridge.request_id,
@@ -1626,7 +1717,8 @@ class RuntimeCore:
 
     def stream_v3(self, request: GenerationRequestV3) -> Iterator[StreamEventV3]:
         normalized_request, bridge = self._bridge_v3_request(request)
-        _, selected, cancel_event, timeout_event, legacy_trace = self._begin(bridge)
+        self._require_chat_tools_support(normalized_request)
+        _, selected, cancel_event, timeout_event, legacy_trace = self._begin(bridge, normalized_request.scheduling)
         trace = ExecutionTraceV3(
             execution_id=legacy_trace.execution_id,
             request_id=bridge.request_id,
@@ -1793,6 +1885,17 @@ class RuntimeCore:
     def cancel(self, request_id: str) -> dict[str, Any]:
         with self._lock:
             active = self._active.get(request_id)
+            queued = self._queued.get(request_id)
+            if active is None and queued is not None:
+                queued.cancelled = True
+                self._slot_released.notify_all()
+                return {
+                    "contract_version": CONTRACT_VERSION,
+                    "request_id": request_id,
+                    "cancelled": True,
+                    "adapter_acknowledged": False,
+                    "state": "removed_from_queue",
+                }
         if active is None:
             return {
                 "contract_version": CONTRACT_VERSION,
@@ -1854,6 +1957,12 @@ class RuntimeCore:
         payload["contract_version"] = CONTRACT_V3_VERSION
         payload["supported_contract_versions"] = list(SUPPORTED_CONTRACT_VERSIONS_V3)
         payload["host_execution_capabilities"] = self.host_v3()["execution_capabilities"]
+        with self._lock:
+            payload["generation_queue"] = {
+                "schema_version": SCHEDULING_OPTIONS_VERSION,
+                "priorities": list(QUEUE_PRIORITIES),
+                "queued_request_ids": self._queued_request_ids(),
+            }
         return payload
 
     def runtime_metrics(self) -> dict[str, Any]:
