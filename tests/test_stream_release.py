@@ -18,7 +18,7 @@ from runtime_foundation.adapters.mock import MockAdapter
 from runtime_foundation.contracts_v3 import ExecutionConstraints, GenerationOptions, GenerationRequestV3, LoadOptions
 from runtime_foundation.core import LifecycleState, RuntimeCore
 from runtime_foundation.host import HostProfile
-from runtime_foundation.service import create_app
+from runtime_foundation.service import _EventStreamResponse, create_app
 
 
 def _loaded_core(tmp_path) -> RuntimeCore:
@@ -160,6 +160,40 @@ def test_a_response_whose_client_already_left_releases_the_slot(tmp_path) -> Non
     anyio.run(app, scope, receive, send)
 
     _assert_idle(core, within_seconds=1.5)
+
+
+def test_closing_a_response_does_not_wait_for_a_busy_thread_pool() -> None:
+    # Requests queued for the generation slot can hold every worker of the
+    # default thread limiter; the stream that would free the slot must still close.
+    class _Events:
+        closed = False
+
+        def __iter__(self):
+            return iter(())
+
+        def close(self) -> None:
+            _Events.closed = True
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}}
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        return None
+
+    async def main() -> None:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 1
+        await limiter.acquire()
+        try:
+            with anyio.fail_after(2):
+                await _EventStreamResponse(_Events())(scope, receive, send)
+        finally:
+            limiter.release()
+
+    anyio.run(main)
+    assert _Events.closed
 
 
 def test_a_client_that_disconnects_mid_stream_releases_the_slot(served_core) -> None:

@@ -45,8 +45,11 @@ class _EventStreamResponse(StreamingResponse):
         finally:
             close = getattr(self._events, "close", None)
             if callable(close):
+                # Requests waiting for the generation slot hold workers from the
+                # default thread limiter; the cleanup that frees the slot must
+                # not wait behind them.
                 with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(close)
+                    await anyio.to_thread.run_sync(close, limiter=anyio.CapacityLimiter(1))
 
 
 def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding | ArtifactBindingV2 | ExecutionInputV1:
