@@ -151,3 +151,11 @@ carries it). `delta` events keep the `execution_evidence` key with the value
 `null`, so a stream's size grows with the generated text, not with the number
 of tokens times the evidence size. Every event still carries `request_id` and
 `execution_id`.
+
+A stream holds the generation slot from the moment the request is accepted,
+including while it waits in the queue. If the client disconnects, at any point
+including while queued, the service closes the stream when the response ends:
+the engine is asked to stop and the slot is released, and the trace is recorded
+as `abandoned`. Cancelling, or reaching `timeout_ms` on, a stream whose client
+has not started reading it releases the slot at once; the cancel response then
+reports `state: "released_unread_stream"`.

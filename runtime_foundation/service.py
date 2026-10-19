@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable, Iterator
 from typing import Any
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -17,6 +19,37 @@ from .errors import InvalidRequestError, RuntimeFoundationError
 from .instance_lock import InstanceAlreadyRunningError, acquire_instance_lock, lock_path_from_environment
 from .network import validate_loopback_host
 from .version import FOUNDATION_VERSION
+
+
+class _EventStreamResponse(StreamingResponse):
+    """NDJSON stream that always closes its event stream when the response ends.
+
+    Starlette leaves a synchronous iterator suspended when the client
+    disconnects, and does not iterate it at all when the client left while
+    the request was queued. Closing it here releases the generation slot
+    and stops the engine instead of relying on garbage collection.
+    """
+
+    def __init__(self, events: Iterable[Any]) -> None:
+        self._events = events
+        super().__init__(self._lines(events), media_type="application/x-ndjson")
+
+    @staticmethod
+    def _lines(events: Iterable[Any]) -> Iterator[str]:
+        for event in events:
+            yield json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close = getattr(self._events, "close", None)
+            if callable(close):
+                # Requests waiting for the generation slot hold workers from the
+                # default thread limiter; the cleanup that frees the slot must
+                # not wait behind them.
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(close, limiter=anyio.CapacityLimiter(1))
 
 
 def _artifact_from_body(body: dict[str, Any]) -> ModelArtifactBinding | ArtifactBindingV2 | ExecutionInputV1:
@@ -203,33 +236,15 @@ def create_app(core: RuntimeCore | None = None) -> FastAPI:
     def generate_stream(body: dict[str, Any]) -> StreamingResponse:
         request = _generation_request(body)
         if isinstance(request, GenerationRequestV3):
-            events = runtime.stream_v3(request)
-
-            def v3_lines():
-                for event in events:
-                    yield json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
-
-            return StreamingResponse(v3_lines(), media_type="application/x-ndjson")
-        events = runtime.stream(request)
-
-        def lines():
-            for event in events:
-                yield json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
-
-        return StreamingResponse(lines(), media_type="application/x-ndjson")
+            return _EventStreamResponse(runtime.stream_v3(request))
+        return _EventStreamResponse(runtime.stream(request))
 
     @app.post("/v3/generate/stream")
     def generate_stream_v3(body: dict[str, Any]) -> StreamingResponse:
         request = _generation_request(body)
         if not isinstance(request, GenerationRequestV3):
             raise InvalidRequestError("/v3/generate/stream requires a v3 GenerationRequest")
-        events = runtime.stream_v3(request)
-
-        def lines():
-            for event in events:
-                yield json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
-
-        return StreamingResponse(lines(), media_type="application/x-ndjson")
+        return _EventStreamResponse(runtime.stream_v3(request))
 
     @app.post("/requests/{request_id}/cancel")
     def cancel(request_id: str) -> dict[str, Any]:
