@@ -96,6 +96,21 @@ def test_v3_streaming_events_carry_evidence_and_stable_ids(tmp_path) -> None:
     assert terminal["result"]["execution_evidence"]["execution_binding_fingerprint"] == events[0].evidence.execution_binding.fingerprint
 
 
+def test_v3_stream_delta_events_do_not_repeat_execution_evidence(tmp_path) -> None:
+    core, artifact = _core_and_artifact(tmp_path)
+    core.load(artifact, adapter="mock", load_options=LoadOptions(), consumer_id="test-consumer")
+
+    events = [event.to_dict() for event in core.stream_v3(_request(artifact, request_id="stream-v3-delta"))]
+
+    deltas = [event for event in events if event["type"] == "delta"]
+    assert deltas
+    assert all("execution_evidence" in event and event["execution_evidence"] is None for event in deltas)
+    assert events[0]["type"] == "started"
+    assert events[-1]["type"] == "completed"
+    assert events[0]["execution_evidence"] is not None
+    assert events[-1]["execution_evidence"] == events[0]["execution_evidence"]
+
+
 def test_client_uses_v3_load_generate_and_stream_routes(tmp_path) -> None:
     core, artifact = _core_and_artifact(tmp_path)
     client = LocalRuntimeClient(http_client=TestClient(create_app(core)))

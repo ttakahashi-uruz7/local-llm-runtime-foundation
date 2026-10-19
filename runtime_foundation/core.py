@@ -1898,12 +1898,14 @@ class RuntimeCore:
                         self._end(bridge.request_id)
                         yield event_payload
                         return
+                    # Evidence is sent on started and on the terminal event only;
+                    # repeating it on every delta made long streams grow by the
+                    # evidence size per token.
                     yield StreamEventV3(
                         type=event.type,
                         request_id=bridge.request_id,
                         sequence=sequence,
                         execution_id=trace.execution_id,
-                        evidence=evidence,
                         delta=event.delta,
                         done=event.done,
                         result=event.result,
