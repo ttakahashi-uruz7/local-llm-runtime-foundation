@@ -328,6 +328,98 @@ def test_core_verifies_complete_local_content_identity_before_engine_load(tmp_pa
         core.load(execution_input=input_with_wrong_digest, adapter="mock")
 
 
+def _count_complete_hashes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    import runtime_foundation.core as core_module
+
+    hashed: list[str] = []
+    original = ContentIdentity.from_file
+
+    def counting(path, *args, **kwargs):
+        hashed.append(str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(core_module.ContentIdentity, "from_file", staticmethod(counting))
+    return hashed
+
+
+def test_sharing_a_loaded_execution_input_does_not_rehash_unchanged_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = _input(tmp_path)
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mock": MockAdapter()})
+    hashed = _count_complete_hashes(monkeypatch)
+
+    first = core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    assert len(hashed) == 2  # base file and adapter directory, verified once
+    shared = core.load(execution_input=direct, adapter="mock", consumer_id="novel")
+
+    assert shared["reused"] is True
+    assert len(hashed) == 2
+    core.unload(direct.base.artifact_id, consumer_id="novel", lease_id=shared["lease_id"])
+    core.unload(direct.base.artifact_id, consumer_id="rsvp", lease_id=first["lease_id"])
+
+    # After the last lease is gone a new load verifies the content again.
+    core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    assert len(hashed) == 4
+
+
+def test_sharing_rehashes_and_refuses_when_a_loaded_file_changed_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = _input(tmp_path)
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mock": MockAdapter()})
+    core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    hashed = _count_complete_hashes(monkeypatch)
+
+    base_path = Path(direct.base.locator.value)
+    base_path.write_bytes(b"replaced base contents")
+
+    with pytest.raises(ArtifactCompatibilityError, match="does not match"):
+        core.load(execution_input=direct, adapter="mock", consumer_id="novel")
+    assert hashed == [str(base_path)]
+
+
+def test_sharing_rehashes_after_a_same_size_rewrite_that_restores_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    direct = _input(tmp_path, base_contents=b"base fixture")
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mock": MockAdapter()})
+    core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    hashed = _count_complete_hashes(monkeypatch)
+
+    base_path = Path(direct.base.locator.value)
+    before = base_path.stat()
+    base_path.write_bytes(b"BASE FIXTURE")  # same length, different content
+    os.utime(base_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    with pytest.raises(ArtifactCompatibilityError, match="does not match"):
+        core.load(execution_input=direct, adapter="mock", consumer_id="novel")
+    assert hashed == [str(base_path)]
+
+
+def test_fresh_load_verifies_content_skipped_for_an_instance_unloaded_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = _input(tmp_path)
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mock": MockAdapter()})
+    first = core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    hashed = _count_complete_hashes(monkeypatch)
+    original = core._load_validated
+
+    def unload_first(**kwargs):
+        # The only lease holder leaves after the cached signatures were read.
+        core.unload(direct.base.artifact_id, consumer_id="rsvp", lease_id=first["lease_id"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(core, "_load_validated", unload_first)
+    loaded = core.load(execution_input=direct, adapter="mock", consumer_id="novel")
+
+    assert loaded["reused"] is False
+    assert len(hashed) == 2  # base and adapter verified before the fresh engine load
+
+
 def test_core_rejects_missing_adapter_before_engine_load(tmp_path: Path) -> None:
     direct = _input(tmp_path)
     adapter = direct.adapters[0]
