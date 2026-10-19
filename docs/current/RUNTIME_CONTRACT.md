@@ -144,3 +144,10 @@ gate passes, the first event is `started`; zero or more `delta` events follow;
 the terminal event is `completed` with a `GenerationResult` payload. A guard
 failure emits only a terminal `error` event and never emits `started` or a
 token delta. The service does not convert stream events into a Benchmark score.
+
+On `/v3/generate/stream`, `execution_evidence` is carried by the `started` event
+and by the terminal `completed` or `error` event (the `completed` result also
+carries it). `delta` events keep the `execution_evidence` key with the value
+`null`, so a stream's size grows with the generated text, not with the number
+of tokens times the evidence size. Every event still carries `request_id` and
+`execution_id`.
