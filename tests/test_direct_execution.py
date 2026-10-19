@@ -379,6 +379,47 @@ def test_sharing_rehashes_and_refuses_when_a_loaded_file_changed_on_disk(
     assert hashed == [str(base_path)]
 
 
+def test_sharing_rehashes_after_a_same_size_rewrite_that_restores_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    direct = _input(tmp_path, base_contents=b"base fixture")
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mock": MockAdapter()})
+    core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    hashed = _count_complete_hashes(monkeypatch)
+
+    base_path = Path(direct.base.locator.value)
+    before = base_path.stat()
+    base_path.write_bytes(b"BASE FIXTURE")  # same length, different content
+    os.utime(base_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    with pytest.raises(ArtifactCompatibilityError, match="does not match"):
+        core.load(execution_input=direct, adapter="mock", consumer_id="novel")
+    assert hashed == [str(base_path)]
+
+
+def test_fresh_load_verifies_content_skipped_for_an_instance_unloaded_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = _input(tmp_path)
+    core = RuntimeCore(host_profile=HostProfile.mock_windows(), adapters={"mock": MockAdapter()})
+    first = core.load(execution_input=direct, adapter="mock", consumer_id="rsvp")
+    hashed = _count_complete_hashes(monkeypatch)
+    original = core._load_validated
+
+    def unload_first(**kwargs):
+        # The only lease holder leaves after the cached signatures were read.
+        core.unload(direct.base.artifact_id, consumer_id="rsvp", lease_id=first["lease_id"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(core, "_load_validated", unload_first)
+    loaded = core.load(execution_input=direct, adapter="mock", consumer_id="novel")
+
+    assert loaded["reused"] is False
+    assert len(hashed) == 2  # base and adapter verified before the fresh engine load
+
+
 def test_core_rejects_missing_adapter_before_engine_load(tmp_path: Path) -> None:
     direct = _input(tmp_path)
     adapter = direct.adapters[0]

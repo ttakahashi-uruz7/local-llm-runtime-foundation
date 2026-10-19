@@ -84,12 +84,13 @@ preflight then inspects JSON and safetensors headers without loading tensors.
 
 When another consumer requests the execution input that is already loaded
 (same execution input fingerprint), Foundation compares each Base and Adapter
-path's on-disk state (device, inode, size and modification time, per file for
-a directory) with the state recorded when that load verified the content. If
-nothing changed, the complete content identity is not recomputed for the
-shared lease; if anything changed, it is recomputed and the request fails on
-a mismatch as above. The recorded state is dropped on unload, so every new
-engine load verifies the full content again.
+path's on-disk state (device, inode, size, modification time and change
+time, per file for a directory) with the state recorded when that load
+verified the content. If nothing changed, the complete content identity is
+not recomputed for the shared lease; if anything changed, it is recomputed and
+the request fails on a mismatch as above. The recorded state is dropped on
+unload, so every new engine load verifies the full content again, including
+when the loaded instance was unloaded while the request was being checked.
 
 ## Compatibility gate
 
