@@ -102,6 +102,25 @@ from .version import FOUNDATION_VERSION
 DEFAULT_CONSUMER_ID = "anonymous"
 
 
+def _content_stat_signature(path: str) -> tuple[Any, ...]:
+    """Cheap fingerprint of a file or directory's on-disk state (no content read).
+
+    Used only to decide whether a complete content identity verified for the
+    currently loaded execution input still describes the same files.
+    """
+
+    target = Path(path)
+    stat = target.stat()
+    if not target.is_dir():
+        return ("file", stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    entries = []
+    for item in sorted(target.rglob("*")):
+        if item.is_file():
+            child = item.stat()
+            entries.append((item.relative_to(target).as_posix(), child.st_ino, child.st_size, child.st_mtime_ns))
+    return ("directory", stat.st_dev, stat.st_ino, tuple(entries))
+
+
 def _build_identity_payload(identity: Any | None) -> dict[str, Any] | None:
     if identity is None:
         return None
@@ -176,6 +195,9 @@ class RuntimeCore:
         self._loaded_artifact: ModelArtifactBinding | None = None
         self._loaded_artifact_v2: ArtifactBindingV2 | None = None
         self._loaded_execution_input: ExecutionInputV1 | None = None
+        # On-disk signatures of the loaded execution input's files, taken when
+        # their complete content identity was verified at load time.
+        self._loaded_content_signatures: dict[str, tuple[Any, ...]] = {}
         self._loaded_load_options: LoadOptions | None = None
         self._loaded_load_options_resolution: LoadOptionsResolutionV1 | None = None
         self._loaded_load_identity: LoadIdentityV1 | None = None
@@ -398,7 +420,15 @@ class RuntimeCore:
                 "model artifact path does not exist",
                 details={"role": "base", "artifact_id": binding.artifact_id, "local_path": binding.local_path},
             )
+        content_signatures: dict[str, tuple[Any, ...]] = {}
         if direct_input is not None:
+            with self._lock:
+                verified_signatures = (
+                    dict(self._loaded_content_signatures)
+                    if self._loaded_execution_input is not None
+                    and self._loaded_execution_input.fingerprint == direct_input.fingerprint
+                    else {}
+                )
             identities = [("base", direct_input.base, None)] + [
                 ("adapter", item, index) for index, item in enumerate(direct_input.adapters)
             ]
@@ -411,6 +441,12 @@ class RuntimeCore:
                     )
                 expected_identity = identity_binding.content_identity
                 assert expected_identity is not None  # Enforced by ExecutionInputV1.
+                signature = _content_stat_signature(path)
+                content_signatures[path] = signature
+                if verified_signatures.get(path) == signature:
+                    # The same execution input is already loaded and its files
+                    # are unchanged since their complete identity was verified.
+                    continue
                 actual_identity = ContentIdentity.from_file(
                     path,
                     scheme="complete",
@@ -460,6 +496,7 @@ class RuntimeCore:
                 verified_gguf=verified_gguf,
                 consumer_id=consumer_id,
                 adapter=adapter,
+                content_signatures=content_signatures,
             )
         finally:
             if verified_gguf is not None:
@@ -476,6 +513,7 @@ class RuntimeCore:
         verified_gguf: VerifiedGGUFArtifact | None,
         consumer_id: str | None,
         adapter: str | None,
+        content_signatures: dict[str, tuple[Any, ...]],
     ) -> dict[str, Any]:
         gguf_observation = verified_gguf.observed.to_dict() if verified_gguf is not None else None
         owner = self._consumer_id(consumer_id)
@@ -638,6 +676,7 @@ class RuntimeCore:
             self._loaded_artifact = binding
             self._loaded_artifact_v2 = artifact_v2
             self._loaded_execution_input = direct_input
+            self._loaded_content_signatures = dict(content_signatures)
             self._loaded_adapter = selected
             self._loaded_load_options = effective_load_options
             self._loaded_load_options_resolution = load_options_resolution
@@ -740,6 +779,7 @@ class RuntimeCore:
             self._loaded_artifact = None
             self._loaded_artifact_v2 = None
             self._loaded_execution_input = None
+            self._loaded_content_signatures = {}
             self._loaded_adapter = None
             self._loaded_load_options = None
             self._loaded_load_options_resolution = None
