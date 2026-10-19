@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import socket
 import threading
@@ -54,20 +55,22 @@ def _assert_idle(core: RuntimeCore, within_seconds: float = 5.0) -> None:
 
 def test_cancel_releases_a_stream_nobody_started_reading(tmp_path) -> None:
     core = _loaded_core(tmp_path)
-    core.stream_v3(_request("unread"))
+    stream = core.stream_v3(_request("unread"))  # held, never read
     assert list(core._active) == ["unread"]
 
     cancelled = core.cancel("unread")
 
     assert cancelled["state"] == "released_unread_stream"
     _assert_idle(core)
+    del stream
 
 
 def test_timeout_releases_a_stream_nobody_started_reading(tmp_path) -> None:
     core = _loaded_core(tmp_path)
-    core.stream_v3(_request("unread-timeout", timeout_ms=200))
+    stream = core.stream_v3(_request("unread-timeout", timeout_ms=200))  # held, never read
 
     _assert_idle(core)
+    del stream
 
 
 def test_closing_an_unread_or_partly_read_stream_releases_the_slot(tmp_path) -> None:
@@ -92,6 +95,18 @@ def test_a_reading_consumer_still_gets_the_cancelled_terminal_event(tmp_path) ->
     assert events[-1].type == "error"
     assert events[-1].error["code"] == "cancelled"
     _assert_idle(core)
+
+
+def test_a_dropped_stream_releases_the_slot_when_collected(tmp_path) -> None:
+    core = _loaded_core(tmp_path)
+    stream = core.stream_v3(_request("dropped", max_tokens=64))
+    assert next(stream).type == "started"
+
+    del stream
+    gc.collect()
+
+    _assert_idle(core)
+    core.unload("stream-release-model", consumer_id="stream-release-test")
 
 
 @pytest.fixture

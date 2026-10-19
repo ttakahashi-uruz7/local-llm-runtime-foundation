@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -179,7 +180,13 @@ class _ActiveRequest:
     adapter: EngineAdapter
     trace: ExecutionTrace
     timeout_timer: threading.Timer | None = None
-    stream: _ReservedStream | None = None
+    # Held weakly: a direct caller that drops a stream without closing it
+    # lets garbage collection run the generator's cleanup and free the slot.
+    stream: weakref.ref[_ReservedStream] | None = None
+
+    def release_unread_stream(self) -> bool:
+        stream = self.stream() if self.stream is not None else None
+        return stream is not None and stream.release_if_unconsumed()
 
 
 class _ReservedStream(Iterator[Any]):
@@ -1024,8 +1031,7 @@ class RuntimeCore:
             # The adapter's cooperative cancellation hook must not prevent the
             # Core from recording the timeout.
             pass
-        if active.stream is not None:
-            active.stream.release_if_unconsumed()
+        active.release_unread_stream()
 
     @staticmethod
     def _timeout_error(request: GenerationRequest, trace: ExecutionTrace) -> RuntimeTimeoutError:
@@ -2027,7 +2033,7 @@ class RuntimeCore:
 
         stream = _ReservedStream(generator, cancel)
         if active is not None:
-            active.stream = stream
+            active.stream = weakref.ref(stream)
         return stream
 
     def cancel(self, request_id: str) -> dict[str, Any]:
@@ -2053,7 +2059,7 @@ class RuntimeCore:
             }
         active.cancel_event.set()
         adapter_cancelled = active.adapter.cancel(request_id)
-        if active.stream is not None and active.stream.release_if_unconsumed():
+        if active.release_unread_stream():
             return {
                 "contract_version": CONTRACT_VERSION,
                 "request_id": request_id,
