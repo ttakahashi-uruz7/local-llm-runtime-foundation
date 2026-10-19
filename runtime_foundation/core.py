@@ -179,6 +179,71 @@ class _ActiveRequest:
     adapter: EngineAdapter
     trace: ExecutionTrace
     timeout_timer: threading.Timer | None = None
+    stream: _ReservedStream | None = None
+
+
+class _ReservedStream(Iterator[Any]):
+    """A stream whose generation slot is released even if nobody reads it.
+
+    ``stream`` and ``stream_v3`` reserve the slot when they are called, but
+    their events are produced only when a consumer advances the iterator. A
+    client that disconnects while queued, or before reading, would otherwise
+    hold the slot forever: an unstarted generator's ``finally`` never runs and
+    cancel or timeout only signal code that is never resumed. The wrapped
+    generator is advanced once to a priming ``yield`` inside its ``try``, so
+    ``close()`` always runs its cleanup.
+    """
+
+    def __init__(self, generator: Iterator[Any], cancel: Any) -> None:
+        self._generator = generator
+        self._cancel = cancel
+        self._lock = threading.Lock()
+        self._consumed = False
+        self._running = False
+        self._closed = False
+
+    def __iter__(self) -> _ReservedStream:
+        return self
+
+    def __next__(self) -> Any:
+        with self._lock:
+            if self._closed:
+                raise StopIteration
+            self._consumed = True
+            self._running = True
+        try:
+            return next(self._generator)
+        finally:
+            with self._lock:
+                self._running = False
+                close_now = self._closed
+            if close_now:
+                self._generator.close()
+
+    def close(self) -> None:
+        """Stop the stream; cleanup runs now, or when an in-flight read returns."""
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            running = self._running
+        if running:
+            # Another thread is inside next(); it closes the generator when the
+            # engine yields. Ask the engine to stop instead of finishing.
+            self._cancel()
+            return
+        self._generator.close()
+
+    def release_if_unconsumed(self) -> bool:
+        """Close a stream no consumer has started reading; True if it was released."""
+
+        with self._lock:
+            if self._consumed or self._closed:
+                return False
+            self._closed = True
+        self._generator.close()
+        return True
 
 
 class RuntimeCore:
@@ -959,6 +1024,8 @@ class RuntimeCore:
             # The adapter's cooperative cancellation hook must not prevent the
             # Core from recording the timeout.
             pass
+        if active.stream is not None:
+            active.stream.release_if_unconsumed()
 
     @staticmethod
     def _timeout_error(request: GenerationRequest, trace: ExecutionTrace) -> RuntimeTimeoutError:
@@ -1413,6 +1480,7 @@ class RuntimeCore:
                     self._end(request.request_id)
 
             try:
+                yield cast(StreamEvent, None)  # priming point, see _ReservedStream
                 resolution = self._resolve_runtime_and_guard(request, selected, timeout_event, trace)
                 trace_v2: ExecutionTraceV2 = cast(ExecutionTraceV2, trace.trace_v2)
                 effective_request = self._prepare_effective_request(request, selected, resolution, trace_v2)
@@ -1544,7 +1612,7 @@ class RuntimeCore:
                 finally:
                     finalize()
 
-        return iterator()
+        return self._reserve_stream(request.request_id, iterator())
 
     def _require_chat_tools_support(self, request: GenerationRequestV3) -> None:
         if not request.uses_chat_tools:
@@ -1815,6 +1883,7 @@ class RuntimeCore:
                 )
 
             try:
+                yield cast(StreamEventV3, None)  # priming point, see _ReservedStream
                 evidence, effective_options, prepared = self._execution_evidence_v3(normalized_request, selected)
                 trace.evidence = evidence
                 self._raise_if_timed_out(bridge, timeout_event, legacy_trace)
@@ -1940,7 +2009,26 @@ class RuntimeCore:
                     self._save_v3_trace(trace)
                     self._end(bridge.request_id)
 
-        return iterator()
+        return self._reserve_stream(bridge.request_id, iterator())
+
+    def _reserve_stream(self, request_id: str, generator: Iterator[Any]) -> _ReservedStream:
+        next(generator)
+        with self._lock:
+            active = self._active.get(request_id)
+
+        def cancel() -> None:
+            if active is None:
+                return
+            active.cancel_event.set()
+            try:
+                active.adapter.cancel(request_id)
+            except Exception:  # noqa: BLE001, S110 - the stream is closed regardless
+                pass
+
+        stream = _ReservedStream(generator, cancel)
+        if active is not None:
+            active.stream = stream
+        return stream
 
     def cancel(self, request_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1965,6 +2053,14 @@ class RuntimeCore:
             }
         active.cancel_event.set()
         adapter_cancelled = active.adapter.cancel(request_id)
+        if active.stream is not None and active.stream.release_if_unconsumed():
+            return {
+                "contract_version": CONTRACT_VERSION,
+                "request_id": request_id,
+                "cancelled": True,
+                "adapter_acknowledged": adapter_cancelled,
+                "state": "released_unread_stream",
+            }
         return {
             "contract_version": CONTRACT_VERSION,
             "request_id": request_id,
