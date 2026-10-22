@@ -107,3 +107,7 @@ requires both a Metal-capable loaded native build and observed Metal execution.
 - [llama-cpp-python chat template behavior](https://github.com/abetlen/llama-cpp-python#chat-completion)
 - [llama-cpp-python macOS Metal build guidance](https://github.com/abetlen/llama-cpp-python/blob/main/docs/install/macos.md)
 - [llama-cpp-python releases](https://github.com/abetlen/llama-cpp-python/releases)
+
+## Reasoning-history template control
+
+The selected GGUF template may expose `preserve_thinking`. V3 passes this variable only when explicitly requested and retains assistant `reasoning_content` strings through normalization and native formatting. Unsupported controls/history fail before native generation. The implementation uses template inspection without model names or family branches. The optional control does not affect load identity and requires no reload; model/context changes still do. Generation evidence and `template_variables_passed` identify the applied request.

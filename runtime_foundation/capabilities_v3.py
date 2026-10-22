@@ -275,6 +275,12 @@ class EngineCapabilityV3:
                 applicability=applicability,
             )
 
+        option_map["preserve_thinking"] = OptionCapabilityV3(
+            status=CapabilityStatus.UNSUPPORTED if available else CapabilityStatus.UNAVAILABLE,
+            scope=CapabilityScope.GENERATION,
+            reason="the legacy adapter entry does not implement reasoning history preservation",
+            applicability=applicability,
+        )
         status = CapabilityStatus.SUPPORTED if available else CapabilityStatus.UNAVAILABLE
         return cls(
             engine=engine_binding,

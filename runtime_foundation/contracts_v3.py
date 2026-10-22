@@ -204,6 +204,7 @@ class GenerationOptions:
     repetition_window: int | None = None
     stop: tuple[str, ...] = ()
     seed: int | None = None
+    preserve_thinking: bool | None = None
     thinking_intent: ThinkingIntent = field(default_factory=lambda: ThinkingIntent(mode=ThinkingMode.OFF))
     schema_version: str = GENERATION_OPTIONS_VERSION
 
@@ -235,6 +236,8 @@ class GenerationOptions:
         if any(not item for item in stops) or len(set(stops)) != len(stops):
             raise ValueError("generation_options.stop values must be non-empty and unique")
         object.__setattr__(self, "stop", stops)
+        if self.preserve_thinking is not None and not isinstance(self.preserve_thinking, bool):
+            raise ValueError("generation_options.preserve_thinking must be boolean when provided")
         if not isinstance(self.thinking_intent, ThinkingIntent):
             raise ValueError("generation_options.thinking_intent must be a validated ThinkingIntent")
 
@@ -255,6 +258,7 @@ class GenerationOptions:
                 "stop",
                 "seed",
                 "thinking_intent",
+                "preserve_thinking",
             },
             "generation_options",
         )
@@ -272,6 +276,7 @@ class GenerationOptions:
             repetition_window=value.get("repetition_window"),
             stop=tuple(stop),
             seed=value.get("seed"),
+            preserve_thinking=value.get("preserve_thinking"),
             thinking_intent=ThinkingIntent.from_payload(value.get("thinking_intent", {"mode": "OFF"})),
             schema_version=value.get("schema_version", GENERATION_OPTIONS_VERSION),
         )
@@ -321,6 +326,7 @@ class GenerationOptions:
             "stop": list(self.stop),
             "seed": self.seed,
             "thinking_intent": self.thinking_intent.to_dict(),
+            **({"preserve_thinking": self.preserve_thinking} if self.preserve_thinking is not None else {}),
         }
 
 
@@ -416,6 +422,10 @@ def _chat_message(value: Any, index: int) -> dict[str, Any]:
     if not isinstance(value, dict) or not isinstance(value.get("role"), str) or not isinstance(value.get("content"), str):
         raise ValueError(f"messages[{index}] requires string role and content")
     message: dict[str, Any] = {"role": value["role"], "content": value["content"]}
+    if value.get("reasoning_content") is not None:
+        if value["role"] != "assistant" or not isinstance(value["reasoning_content"], str):
+            raise ValueError(f"messages[{index}].reasoning_content requires assistant role and string value")
+        message["reasoning_content"] = value["reasoning_content"]
     tool_calls = value.get("tool_calls")
     if tool_calls is not None:
         if not isinstance(tool_calls, list) or not tool_calls:

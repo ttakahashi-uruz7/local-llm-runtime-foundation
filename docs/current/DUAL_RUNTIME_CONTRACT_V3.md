@@ -209,3 +209,11 @@ The versioned service surface is additive: `/v3/host`,
 `/v3/generate/stream` accept the optional `tools` and `scheduling` fields, and
 `/v3/health` reports `generation_queue`. Existing routes and clients
 continue to serve v1/v2 contracts.
+
+## Optional reasoning-history preservation (2026-10-23)
+
+The v3 generation-options.v1 object accepts optional `preserve_thinking: boolean`. Omission retains the previous wire shape and template behavior; it is not silently converted into an explicit false request. The v3 assistant message accepts optional string `reasoning_content`, including an empty string. Other roles and non-string values are rejected. v1/v2 wire contracts are unchanged.
+
+llama.cpp requires explicit `preserve_thinking=true` when reasoning history is supplied, verifies the selected local template exposes `preserve_thinking`, and checks that a history-bearing request has a template consuming `reasoning_content`. Both explicit true and false are rejected if the template lacks the control. This is model-neutral template inspection, not a model-family exception. Requested/resolved/effective generation evidence retains the supplied value; native template trace records the passed variable. Capability reports expose the control based on the loaded template. This does not prove that a consumer supplied historical reasoning or that quality improved.
+
+The common legacy adapter entry and current MLX adapter reject preservation requests/history rather than dropping them. Consumers must inspect capability and handle unsupported settings. Raw reasoning text remains message content: do not publish it as a benchmark log or add it to metrics; use lengths/counts in external reports.

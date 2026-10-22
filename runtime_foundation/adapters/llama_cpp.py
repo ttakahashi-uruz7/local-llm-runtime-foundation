@@ -729,6 +729,11 @@ class LlamaCppAdapter(EngineAdapter):
                 evidence={"chat_template_variables": sorted(variables)},
             )
 
+        options["preserve_thinking"] = feature(
+            unavailable if not available else supported if "preserve_thinking" in variables else unsupported,
+            "requires a selected template exposing preserve_thinking; reasoning history additionally requires reasoning_content consumption",
+            (False, True),
+        )
         selected_layer_values = tuple(range(0, layer_count + 1)) if layer_count is not None else ()
         options["acceleration.gpu_offload_layers"] = option(
             supported if available else unavailable,
@@ -1626,6 +1631,7 @@ class LlamaCppAdapter(EngineAdapter):
             options.thinking_intent,
             studio_resolved=request.studio_resolved_thinking,
         )
+        self._preservation_parameters(options, request.messages)
         defaults = self._native_generation_defaults()
         seed = options.seed if options.seed is not None else secrets.randbits(32)
         effective = GenerationOptions(
@@ -1642,6 +1648,7 @@ class LlamaCppAdapter(EngineAdapter):
             stop=options.stop,
             seed=seed,
             thinking_intent=resolved_intent,
+            preserve_thinking=options.preserve_thinking,
         )
         requested_intent = options.thinking_intent.to_dict()
         resolved_intent_values = resolved_intent.to_dict()
@@ -1691,6 +1698,23 @@ class LlamaCppAdapter(EngineAdapter):
             resolutions=tuple(resolutions),
         )
 
+    def _preservation_parameters(self, options: GenerationOptions, messages: Any) -> dict[str, Any]:
+        has_history = any("reasoning_content" in message for message in messages)
+        if has_history and options.preserve_thinking is not True:
+            raise UnsupportedGenerationSettingError("reasoning history requires explicit preserve_thinking=true")
+        if options.preserve_thinking is None:
+            return {}
+        with self._lock:
+            variables = self._template_variables
+        if "preserve_thinking" not in variables:
+            raise UnsupportedGenerationSettingError(
+                "the selected template does not expose preserve_thinking",
+                details={"engine": self.name, "option": "preserve_thinking"},
+            )
+        if has_history and "reasoning_content" not in (self._chat_template_text or ""):
+            raise UnsupportedGenerationSettingError("the selected template cannot consume reasoning_content history")
+        return {"preserve_thinking": options.preserve_thinking}
+
     def _template_prompt(
         self,
         llama: Any,
@@ -1714,6 +1738,7 @@ class LlamaCppAdapter(EngineAdapter):
             resolved_intent = intent
         else:
             resolved_intent, template_kwargs = self._thinking_parameters(intent, studio_resolved=studio_resolved)
+        template_kwargs.update(self._preservation_parameters(options, messages))
         try:
             formatted = formatter(messages=messages, **template_kwargs)
         except Exception as exc:  # noqa: BLE001 - template failures are runtime evidence
