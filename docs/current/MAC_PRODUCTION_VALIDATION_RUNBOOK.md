@@ -176,3 +176,14 @@ is provenance evidence only and is never accepted as a Foundation
 ## Stop conditions
 
 If MLX is unavailable, Metal allocation fails, a context run fails, memory pressure/swap is observed, or cleanup is incomplete, record the raw observation and failure. Do not convert it inside Foundation into a Benchmark verdict. The consumer applies its own current policy.
+
+## Optional multi-turn preservation smoke
+
+Before testing, record host/build/artifact identity, ensure there is no active request or another consumer's lease, and preserve any consumer pause/default-selection settings. Use the existing loopback service and a locally acquired compatible artifact; do not start a second model service or download a model.
+
+1. Send a short thinking-enabled turn with preserve_thinking=true.
+2. Return the resulting assistant reasoning and tool/answer history in a second request.
+3. Verify explicit true in requested/resolved/effective options, `preserve_thinking` in template_variables_passed, nonzero historical reasoning length, actual native token generation, and the expected artifact/context identity.
+4. Release only the test consumer's lease, confirm no active/queued requests, and restore pause/default selection.
+
+Unsupported templates, MLX, and the common legacy path must reject the optional control/history. Unit fixtures establish the contract but are not Apple Silicon evidence. Record a real run separately, including any denied consumer command; do not mark an entire coding agent workflow PASS because generation alone succeeded.

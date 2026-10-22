@@ -890,3 +890,25 @@ def test_thinking_off_runs_on_a_template_without_thinking_control(tmp_path: Path
         core.generate_v3(_request("local-test-gguf", loaded["lease_id"], request_id="off-uninspectable"))
     assert len(_FakeLlama.instances[-1].completion_calls) == calls_before
     core.unload()
+
+
+def test_preservation_requires_template_support_and_explicit_opt_in(tmp_path: Path):
+    path = tmp_path / "test-only.gguf"
+    _gguf(path)
+    core, adapter = _runtime(path)
+    loaded = core.load(_artifact(path), load_options=_load_options())
+    original = _request("local-test-gguf", loaded["lease_id"])
+    options = replace(original.generation_options, preserve_thinking=True)
+    with pytest.raises(UnsupportedGenerationSettingError, match="preserve_thinking"):
+        core.generate_v3(replace(original, generation_options=options))
+    # Synthetic template capability; this is contract verification, not a real model result.
+    adapter._template_variables = adapter._template_variables | {"preserve_thinking"}
+    adapter._chat_template_text += "{{ preserve_thinking }}{{ messages[0].reasoning_content }}"
+    history = ({"role": "assistant", "content": "answer", "reasoning_content": "SYNTHETIC_REASONING_MARKER"},)
+    with pytest.raises(UnsupportedGenerationSettingError, match="explicit"):
+        core.generate_v3(replace(original, messages=history))
+    result = core.generate_v3(replace(original, messages=history, generation_options=options))
+    assert _FakeLlama.instances[-1].template_calls[-1]["preserve_thinking"] is True
+    assert _FakeLlama.instances[-1].template_calls[-1]["messages"][0]["reasoning_content"] == "SYNTHETIC_REASONING_MARKER"
+    assert result.evidence.to_dict()["options"]["generation"]["effective"]["preserve_thinking"] is True
+    core.unload("local-test-gguf", lease_id=loaded["lease_id"])

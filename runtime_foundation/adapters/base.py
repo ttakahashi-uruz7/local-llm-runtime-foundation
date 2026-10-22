@@ -177,7 +177,10 @@ class EngineAdapter(ABC):
         """Validate v3 generation settings before mapping the representable v1/v2 subset."""
 
         options = request.generation_options
+        if any("reasoning_content" in message for message in request.messages):
+            raise UnsupportedGenerationSettingError("this adapter does not implement reasoning history")
         unsupported_fields = {
+            "preserve_thinking": options.preserve_thinking,
             "top_k": options.top_k,
             "repetition_penalty": options.repetition_penalty,
             "repetition_window": options.repetition_window,

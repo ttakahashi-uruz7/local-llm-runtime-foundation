@@ -118,3 +118,7 @@ Real Apple Silicon Mac Production Validation completed on 2026-09-22 for the Fou
 - The stale active-request state after preflight failure was fixed and regression-tested in PR #10.
 
 Foundation reports how a supplied artifact was executed. It does not approve models, assign Benchmark status, or determine Production Eligibility; those decisions remain with the consumer authority.
+
+## Optional reasoning history (2026-10-23)
+
+Foundation owns validated message transport and native template control for optional V3 reasoning-history preservation. Consumers own which history to retain, task decomposition, retries and quality evaluation. The current llama.cpp adapter checks the selected template; MLX/common legacy entries explicitly reject preservation. This adds no model-specific behavior or production eligibility judgment. Contract and integration details are in DUAL_RUNTIME_CONTRACT_V3.md and INTEGRATION_GUIDE.md.

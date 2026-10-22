@@ -532,6 +532,11 @@ class MLXAdapter(EngineAdapter):
                     unit="tokens",
                     evidence={"requires_loaded_tokenizer": True, "preflight": "prompt_tokens + max_tokens"},
                 ),
+                "preserve_thinking": option(
+                    unsupported_or_unavailable,
+                    CapabilityScope.GENERATION,
+                    "MLX adapter does not implement reasoning history preservation",
+                ),
                 "top_k": option(
                     top_k_status,
                     CapabilityScope.GENERATION,
@@ -690,6 +695,8 @@ class MLXAdapter(EngineAdapter):
 
     def resolve_generation_options_v3(self, request: GenerationRequestV3) -> SettingsEvidenceV3:
         options = request.generation_options
+        if options.preserve_thinking is not None or any("reasoning_content" in message for message in request.messages):
+            raise UnsupportedGenerationSettingError("MLX adapter does not implement reasoning history preservation")
         intent = options.thinking_intent
         if intent.effort is not None or intent.budget_tokens is not None:
             raise UnsupportedGenerationSettingError(

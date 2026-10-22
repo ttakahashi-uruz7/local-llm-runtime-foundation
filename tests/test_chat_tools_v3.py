@@ -208,3 +208,23 @@ def test_tools_and_scheduling_reach_the_service_over_http(tmp_path) -> None:
 
     assert result["contract_version"] == "runtime-foundation.contract.v3"
     assert client.health_v3()["generation_queue"]["priorities"] == ["interactive", "background"]
+
+
+def test_reasoning_history_round_trip_and_validation():
+    messages = [{"role": "assistant", "content": "answer", "reasoning_content": "SYNTHETIC_REASONING_MARKER"}]
+    request = GenerationRequestV3(model_artifact_id="m", messages=messages,
+        generation_options=GenerationOptions(preserve_thinking=True))
+    restored = GenerationRequestV3.from_payload(request.to_dict())
+    assert restored.template_messages() == messages
+    assert restored.generation_options.preserve_thinking is True
+    assert "preserve_thinking" not in GenerationOptions().to_dict()
+    for message in [{"role": "user", "content": "x", "reasoning_content": "bad"},
+                    {"role": "assistant", "content": "x", "reasoning_content": 1}]:
+        with pytest.raises(ValueError):
+            GenerationRequestV3(model_artifact_id="m", messages=[message])
+    with pytest.raises(ValueError):
+        GenerationOptions(preserve_thinking="true")
+    with pytest.raises(UnsupportedGenerationSettingError):
+        MockAdapter().resolve_generation_options_v3(request)
+    with pytest.raises(UnsupportedGenerationSettingError):
+        MLXAdapter().resolve_generation_options_v3(request)

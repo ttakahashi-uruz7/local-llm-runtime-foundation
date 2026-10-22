@@ -159,3 +159,7 @@ the engine is asked to stop and the slot is released, and the trace is recorded
 as `abandoned`. Cancelling, or reaching `timeout_ms` on, a stream whose client
 has not started reading it releases the slot at once; the cancel response then
 reports `state: "released_unread_stream"`.
+
+## V3 reasoning-history extension
+
+V3 optionally carries assistant `reasoning_content` and generation `preserve_thinking`. See DUAL_RUNTIME_CONTRACT_V3.md for validation, engine support, omission compatibility and evidence requirements. Legacy v1/v2 contracts retain their own unchanged message/control shapes.

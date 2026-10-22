@@ -128,3 +128,11 @@ Learning may use the Foundation client to check inference behavior of a learned 
 ## No automatic acquisition
 
 The consumer must resolve Model Registry/acquisition outside Foundation and pass a local path. Foundation may verify existence and may receive a hash, but it does not download, cache, promote, or register the artifact.
+
+## Reasoning history in multi-turn local clients
+
+For a template that supports preservation, keep each prior assistant turn's string `reasoning_content` alongside its answer/tool calls, and set `generation_options.preserve_thinking=true`. Forward the field through every intermediate message transformation. A template flag without actual historical messages does not preserve anything. Clients that opt out must omit both the field and the optional setting, or explicitly request false only when supported. History counts toward the same exact prompt/context budget.
+
+A consumer may maintain a validated per-profile configuration for temperature, top_p, top_k, repetition_penalty, max_tokens and thinking_intent. Context remains a LoadOptions setting and must agree with the client's context window. Compare requested/resolved/effective evidence rather than assuming that UI settings reached the engine. `min_p` and `presence_penalty` are not public GenerationOptions fields in this version; unknown request fields remain rejected. SDK retry/tool-loop limits are consumer responsibilities.
+
+Validate preservation with two turns: obtain reasoning and a tool/answer turn, send that actual reasoning back, verify the template variables and generation evidence, and check prompt token growth and cancellation/unload behavior. A successful contract smoke is not a coding-quality or deployment-eligibility verdict.
