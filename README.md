@@ -41,6 +41,8 @@ The Windows development path uses `MockAdapter` only when the consumer explicitl
 
 The Python client preserves Foundation remote errors without policy reinterpretation: `RemoteRuntimeError` exposes the wire `code`, `message`, strict-boolean `retryable`, `details`, and HTTP `status_code`. Consumers must use the Foundation-provided retryability and must not reconstruct it from an error code.
 
+On macOS, Studio apps start the service on demand with `scripts/mac/ensure-foundation.sh`: it does nothing when `/health` already answers, otherwise it starts `.venv/bin/python -m runtime_foundation` detached (log: `~/Library/Logs/local-llm-runtime-foundation/service.log`) and waits for `/health`. The single-instance lock keeps concurrent callers to one service.
+
 ## Contract and service
 
 - Current contract: `runtime-foundation.contract.v3`
